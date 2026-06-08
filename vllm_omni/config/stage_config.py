@@ -11,7 +11,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, Mapping, NamedTuple
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
@@ -1073,10 +1073,16 @@ class StageConfigFactory:
         model: str,
         cli_overrides: dict[str, Any] | None = None,
         deploy_config_path: str | None = None,
+        strategy_specs: Mapping[Any, Any] | None = None,
     ) -> list[StageConfig] | None:
         """Load pipeline + deploy config, merge with CLI overrides.
 
         Checks _PIPELINE_REGISTRY first (new path), falls back to legacy YAML.
+
+        When ``strategy_specs`` is provided (a mapping of role -> list of
+        ``StrategySpec``), the derived parallel sizing is overlaid onto the
+        merged stages (see ``vllm_omni.config.composable_parallel``). This is
+        opt-in: omitting it leaves the existing merge path untouched.
         """
         if cli_overrides is None:
             cli_overrides = {}
@@ -1093,7 +1099,9 @@ class StageConfigFactory:
             if _looks_like_dreamzero(model):
                 model_type = "dreamzero"
         if model_type and model_type in _PIPELINE_REGISTRY:
-            return cls._create_from_registry(model_type, cli_overrides, deploy_config_path)
+            return cls._create_from_registry(
+                model_type, cli_overrides, deploy_config_path, strategy_specs
+            )
 
         # --- HF architecture fallback: some models report a generic
         # model_type that collides with another model. Match by the
@@ -1126,11 +1134,36 @@ class StageConfigFactory:
                                 registered.model_type,
                             )
                             continue
-                    return cls._create_from_registry(registered.model_type, cli_overrides, deploy_config_path)
+                    return cls._create_from_registry(
+                        registered.model_type, cli_overrides, deploy_config_path, strategy_specs
+                    )
 
         # Not in the pipeline registry — let the caller fall back to the
         # legacy ``stage_configs/*.yaml`` path (resolve_model_config_path).
         return None
+
+    @staticmethod
+    def _apply_strategy_specs(
+        stages: list[StageConfig],
+        strategy_specs: Mapping[Any, Any] | None,
+    ) -> None:
+        """Overlay derived parallel sizing onto merged stages (opt-in).
+
+        ``omni_lb_policy`` cannot be set from stage configs (omni reads it once
+        at engine construction), so a derived non-default policy is logged for
+        the caller to pass via ``--omni-lb-policy``.
+        """
+        if not strategy_specs:
+            return
+        from vllm_omni.config.composable_parallel import apply_strategy_specs
+
+        applied = apply_strategy_specs(stages, strategy_specs)
+        if applied.omni_lb_policy is not None:
+            logger.info(
+                "[composable_parallel] strategy derived omni_lb_policy=%r; pass it via "
+                "--omni-lb-policy (it is an engine-level knob, not a per-stage config field).",
+                applied.omni_lb_policy,
+            )
 
     @classmethod
     def _create_from_registry(
@@ -1138,6 +1171,7 @@ class StageConfigFactory:
         model_type: str,
         cli_overrides: dict[str, Any],
         deploy_config_path: str | None = None,
+        strategy_specs: Mapping[Any, Any] | None = None,
     ) -> list[StageConfig]:
         """Create StageConfigs from pipeline registry + deploy YAML.
 
@@ -1184,6 +1218,9 @@ class StageConfigFactory:
         pipeline_cfg = _PIPELINE_REGISTRY[pipeline_key]
 
         stages = merge_pipeline_deploy(pipeline_cfg, deploy_cfg, cli_overrides)
+
+        # Overlay declarative parallel strategies (opt-in) before CLI overrides.
+        cls._apply_strategy_specs(stages, strategy_specs)
 
         explicit_overrides = {k: v for k, v in cli_overrides.items() if v is not None}
 
