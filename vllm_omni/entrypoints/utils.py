@@ -317,6 +317,7 @@ def load_stage_configs_from_model(
     deploy_config_path: str | None = None,
     stage_overrides: dict[str, dict[str, Any]] | None = None,
     strategy_config_path: str | None = None,
+    strategy_out: dict[str, Any] | None = None,
 ) -> list:
     """Load stage configurations from model's default config file.
 
@@ -334,6 +335,9 @@ def load_stage_configs_from_model(
         strategy_config_path: Optional path to a composable-parallel
             ``strategy.yaml`` whose derived sizing is overlaid onto the
             registry-merged stages (opt-in; ignored on the legacy YAML path).
+        strategy_out: Optional mutable dict that receives strategy-derived
+            pipeline-wide outputs (currently ``omni_lb_policy``) for the engine
+            to apply.
 
     Returns:
         List of stage configuration dictionaries
@@ -358,6 +362,7 @@ def load_stage_configs_from_model(
         cli_overrides=cli_overrides,
         deploy_config_path=deploy_config_path,
         strategy_specs=strategy_specs,
+        strategy_out=strategy_out,
     )
     if stages is not None:
         # Convert StageConfig objects to OmegaConf for backward compat
@@ -519,6 +524,7 @@ def load_and_resolve_stage_configs(
     deploy_config_path: str | None = None,
     stage_overrides: dict[str, dict[str, Any]] | None = None,
     strategy_config_path: str | None = None,
+    strategy_out: dict[str, Any] | None = None,
 ) -> tuple[str, list]:
     """Load stage configurations from model or YAML file with fallback to defaults.
 
@@ -570,6 +576,7 @@ def load_and_resolve_stage_configs(
             deploy_config_path=deploy_config_path,
             stage_overrides=stage_overrides,
             strategy_config_path=strategy_config_path,
+            strategy_out=strategy_out,
         )
         if not stage_configs:
             if default_stage_cfg_factory is not None:
@@ -584,6 +591,7 @@ def load_and_resolve_stage_configs(
             base_engine_args=kwargs,
             stage_overrides=stage_overrides,
             strategy_config_path=strategy_config_path,
+            strategy_out=strategy_out,
         )
         if not stage_configs:
             if default_stage_cfg_factory is not None:
