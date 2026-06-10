@@ -7,11 +7,11 @@ from __future__ import annotations
 import dataclasses
 import re
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping, NamedTuple
+from typing import Any, NamedTuple
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
@@ -1237,9 +1237,15 @@ class StageConfigFactory:
 
             check_device_layout(
                 _eff("devices", stage.yaml_runtime.get("devices")),
-                tensor_parallel_size=int(_eff("tensor_parallel_size", stage.yaml_engine_args.get("tensor_parallel_size", 1)) or 1),
-                data_parallel_size=int(_eff("data_parallel_size", stage.yaml_engine_args.get("data_parallel_size", 1)) or 1),
-                pipeline_parallel_size=int(_eff("pipeline_parallel_size", stage.yaml_engine_args.get("pipeline_parallel_size", 1)) or 1),
+                tensor_parallel_size=int(
+                    _eff("tensor_parallel_size", stage.yaml_engine_args.get("tensor_parallel_size", 1)) or 1
+                ),
+                data_parallel_size=int(
+                    _eff("data_parallel_size", stage.yaml_engine_args.get("data_parallel_size", 1)) or 1
+                ),
+                pipeline_parallel_size=int(
+                    _eff("pipeline_parallel_size", stage.yaml_engine_args.get("pipeline_parallel_size", 1)) or 1
+                ),
                 num_replicas=int(_eff("num_replicas", stage.yaml_runtime.get("num_replicas", 1)) or 1),
                 role=stage.model_stage,
             )
