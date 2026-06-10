@@ -1,0 +1,15 @@
+# Composable-parallel strategy for BAGEL single-stage: Ulysses sequence parallel.
+#
+# Shards the DiT stage's sequence across 2 GPUs with Ulysses sequence
+# parallelism (sp_ulysses: 2). Routing is ShardSequence and aggregation is
+# GatherDim by default, so only axis+size are needed. The translator maps this
+# onto the diffusion engine's ulysses_degree (sequence_parallel_size = 2).
+#
+# Pair with a 2-GPU deploy (deploy_bagel_sp.yaml):
+#   python3 end2end.py --modality text2img --seed 52 \
+#       --deploy-config deploy_bagel_sp.yaml \
+#       --strategy-config strategy_sp_ulysses.yaml
+strategies:
+  dit:
+    - axis: sp_ulysses
+      size: 2

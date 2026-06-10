@@ -31,6 +31,7 @@ from vllm_omni.config.composable_parallel.routing import (
     PipelineMicrobatch,
     RouteByStage,
     RoutingPattern,
+    ShardSequence,
 )
 from vllm_omni.config.composable_parallel.spec import MeshAxisKind, StrategySpec
 
@@ -41,13 +42,25 @@ logger = init_logger(__name__)
 # it, keeping one source of truth) rather than silently flowing through.
 L1Owner = Literal["delegated", "engine"]
 
-# DP, TP, PP, (dense) EP and stage_replica translate today. DP/TP/PP are true
-# world dimensions vLLM realizes intra-engine; dense EP is a flag over the
-# existing TP*DP ranks; stage_replica is an omni-coordinator-level fan-out of
-# independent engine replicas (NOT a vLLM world dimension). The remaining kinds
-# (sequence/context parallel, CFG, VAE pipelines, ...) need per-layer hooks or
-# custom collectives and arrive in later stages.
-_SUPPORTED_KINDS: tuple[MeshAxisKind, ...] = ("dp", "tp", "pp", "ep", "stage_replica")
+# DP, TP, PP, (dense) EP, stage_replica and sequence parallelism (sp_ulysses /
+# sp_ring) translate today. DP/TP/PP are true world dimensions vLLM realizes
+# intra-engine; dense EP is a flag over the existing TP*DP ranks; stage_replica
+# is an omni-coordinator-level fan-out of independent engine replicas (NOT a
+# vLLM world dimension). sp_ulysses/sp_ring shard the sequence dimension and map
+# onto the diffusion engine's existing Ulysses/Ring sequence-parallel runtime
+# (``ulysses_degree`` / ``ring_degree``) — no new runtime is built here, the
+# declarative axes just drive the runtime that already exists. The remaining
+# kinds (CFG, VAE pipelines, sparse EP, ...) need per-layer hooks or custom
+# collectives and arrive in later stages.
+_SUPPORTED_KINDS: tuple[MeshAxisKind, ...] = (
+    "dp",
+    "tp",
+    "pp",
+    "ep",
+    "stage_replica",
+    "sp_ulysses",
+    "sp_ring",
+)
 
 # Which EngineArgs field each axis kind *sizes*. EP and stage_replica are
 # deliberately absent: EP is not an independent world dimension but an
@@ -68,6 +81,10 @@ _DEFAULT_L1_OWNER: dict[MeshAxisKind, L1Owner] = {
     "pp": "engine",
     "ep": "engine",
     "stage_replica": "delegated",
+    # Sequence parallelism is realized intra-engine by the diffusion worker's
+    # Ulysses/Ring sequence-parallel process groups, so it is engine-owned.
+    "sp_ulysses": "engine",
+    "sp_ring": "engine",
 }
 
 # How a RouteByStage policy maps onto omni's load balancer policy string. These
@@ -124,6 +141,12 @@ class OmniParallelConfig:
     # The omni StagePool LB policy string for the (delegated) stage_replica
     # axis, if any. Only meaningful when ``stage_replica_size > 1``.
     omni_lb_policy: str | None = None
+    # Sequence-parallel degrees. These shard the sequence dimension and map onto
+    # the diffusion engine's Ulysses/Ring runtime (``ulysses_degree`` /
+    # ``ring_degree``); their product is the engine's ``sequence_parallel_size``.
+    # Both are true world dimensions (they consume real ranks), unlike EP.
+    sp_ulysses_size: int = 1
+    sp_ring_size: int = 1
     # axis kind -> resolved L1 owner ("delegated" | "engine").
     l1_owners: Mapping[MeshAxisKind, L1Owner] = field(default_factory=dict)
 
@@ -132,8 +155,20 @@ class OmniParallelConfig:
         # EP and stage_replica are intentionally excluded. EP reuses the TP*DP
         # ranks rather than adding a dimension; stage_replica spins up separate
         # engines (each its own world), not extra ranks in this engine's group.
-        # This product is what vLLM calls ``world_size_across_dp`` (tp * pp * dp).
-        return self.tensor_parallel_size * self.data_parallel_size * self.pipeline_parallel_size
+        # Sequence-parallel degrees (ulysses/ring) ARE world dimensions: they
+        # consume real ranks, so [TP(4), SP_Ulysses(2)] is an 8-rank world.
+        return (
+            self.tensor_parallel_size
+            * self.data_parallel_size
+            * self.pipeline_parallel_size
+            * self.sp_ulysses_size
+            * self.sp_ring_size
+        )
+
+    @property
+    def sequence_parallel_size(self) -> int:
+        """Total SP degree (ulysses * ring), the diffusion engine's seq-parallel size."""
+        return self.sp_ulysses_size * self.sp_ring_size
 
     @property
     def delegated_axes(self) -> tuple[MeshAxisKind, ...]:
@@ -158,6 +193,13 @@ class OmniParallelConfig:
         }
         if self.enable_expert_parallel:
             kwargs["enable_expert_parallel"] = True
+        # Sequence parallelism is expressed to the diffusion engine via the
+        # ``ulysses_degree`` / ``ring_degree`` fields (the deploy layer nests
+        # them under ``parallel_config`` and derives ``sequence_parallel_size``).
+        if self.sp_ulysses_size > 1:
+            kwargs["ulysses_degree"] = self.sp_ulysses_size
+        if self.sp_ring_size > 1:
+            kwargs["ring_degree"] = self.sp_ring_size
         return kwargs
 
 
@@ -309,15 +351,35 @@ def _validate_ep(spec: StrategySpec, owner: L1Owner) -> None:
         _fail(f"ep axis {spec.name!r} is realized intra-engine; l1_owner must be 'engine', got {owner!r}")
 
 
+def _validate_sp(spec: StrategySpec, owner: L1Owner) -> None:
+    """Validate a sequence-parallel axis (``sp_ulysses`` / ``sp_ring``).
+
+    SP shards the sequence dimension across ranks and gathers it back, so its
+    routing must be :class:`ShardSequence`. It is realized intra-engine (the
+    diffusion worker creates the Ulysses/Ring sequence-parallel process groups),
+    so it is engine-owned — it is not an omni-coordinator fan-out.
+    """
+    kind = spec.mesh_axis.kind
+    if not isinstance(spec.routing, ShardSequence):
+        _fail(f"{kind} axis {spec.name!r} expects ShardSequence routing, got {type(spec.routing).__name__}")
+    if owner != "engine":
+        _fail(
+            f"{kind} axis {spec.name!r} is realized intra-engine (Ulysses/Ring sequence-parallel "
+            f"groups); l1_owner must be 'engine', got {owner!r}"
+        )
+
+
 def translate_strategy_stack(specs: Sequence[StrategySpec]) -> OmniParallelConfig:
     """Translate a spec stack into an ``OmniParallelConfig``.
 
-    Supported kinds: dp (engine data parallel), tp, pp, (dense) ep, and
-    stage_replica (omni replicas). Raises ``NotImplementedError`` for deferred
-    (affinity / key-stable) routing, and :class:`AxisTranslationError` for any
-    other invalid spec (a kind not yet translatable, a repeated kind, an owner
-    incompatible with the axis kind, or unsupported routing). The EP degree must
-    equal tensor_parallel_size * data_parallel_size.
+    Supported kinds: dp (engine data parallel), tp, pp, (dense) ep,
+    stage_replica (omni replicas), and sp_ulysses / sp_ring (sequence
+    parallelism mapped onto the diffusion engine's Ulysses/Ring runtime).
+    Raises ``NotImplementedError`` for deferred (affinity / key-stable)
+    routing, and :class:`AxisTranslationError` for any other invalid spec (a
+    kind not yet translatable, a repeated kind, an owner incompatible with the
+    axis kind, or unsupported routing). The EP degree must equal
+    tensor_parallel_size * data_parallel_size.
     """
     sizes: dict[str, int] = {"tensor_parallel_size": 1, "data_parallel_size": 1, "pipeline_parallel_size": 1}
     owners: dict[MeshAxisKind, L1Owner] = {}
@@ -325,6 +387,8 @@ def translate_strategy_stack(specs: Sequence[StrategySpec]) -> OmniParallelConfi
     stage_replica_size = 1
     enable_expert_parallel = False
     ep_size: int | None = None
+    sp_ulysses_size = 1
+    sp_ring_size = 1
 
     for spec in specs:
         kind = spec.mesh_axis.kind
@@ -350,6 +414,12 @@ def translate_strategy_stack(specs: Sequence[StrategySpec]) -> OmniParallelConfi
         elif kind == "stage_replica":
             omni_lb_policy = _stage_replica_lb_policy(spec, owner)
             stage_replica_size = spec.mesh_axis.size
+        elif kind == "sp_ulysses":
+            _validate_sp(spec, owner)
+            sp_ulysses_size = spec.mesh_axis.size
+        elif kind == "sp_ring":
+            _validate_sp(spec, owner)
+            sp_ring_size = spec.mesh_axis.size
 
         if kind in _AXIS_TO_ENGINE_FIELD:
             sizes[_AXIS_TO_ENGINE_FIELD[kind]] = spec.mesh_axis.size
@@ -374,5 +444,7 @@ def translate_strategy_stack(specs: Sequence[StrategySpec]) -> OmniParallelConfi
         enable_expert_parallel=enable_expert_parallel,
         stage_replica_size=stage_replica_size,
         omni_lb_policy=omni_lb_policy,
+        sp_ulysses_size=sp_ulysses_size,
+        sp_ring_size=sp_ring_size,
         l1_owners=owners,
     )

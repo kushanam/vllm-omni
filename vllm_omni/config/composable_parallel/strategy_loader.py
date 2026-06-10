@@ -24,7 +24,7 @@ be added without renaming the public surface::
 Per-axis fields:
 
 * ``axis`` (required): mesh-axis kind (``tp``, ``dp``, ``pp``, ``ep``,
-  ``stage_replica`` are translatable today).
+  ``stage_replica``, ``sp_ulysses``, ``sp_ring`` are translatable today).
 * ``size`` (required): axis degree (> 0).
 * ``routing`` (optional): stateless policy for ``dp`` / ``stage_replica`` axes
   (``random`` / ``round_robin`` / ``least_queue``). Ignored for axes whose
@@ -45,6 +45,7 @@ from typing import Any
 from vllm_omni.config.composable_parallel.aggregation import (
     AggregationPattern,
     FanInByStage,
+    GatherDim,
     StitchPipeline,
     TakeRank,
     Union,
@@ -54,6 +55,7 @@ from vllm_omni.config.composable_parallel.routing import (
     PipelineMicrobatch,
     RouteByStage,
     RoutingPattern,
+    ShardSequence,
 )
 from vllm_omni.config.composable_parallel.spec import MeshAxisSpec, StrategySpec
 from vllm_omni.config.yaml_util import load_yaml_config, to_dict
@@ -71,6 +73,8 @@ def _default_routing(kind: str, routing_policy: str | None) -> RoutingPattern:
         return RouteByStage(routing_policy=routing_policy or "round_robin")  # type: ignore[arg-type]
     if kind == "pp":
         return PipelineMicrobatch()
+    if kind in ("sp_ulysses", "sp_ring"):
+        return ShardSequence(dim=1)
     # tp, ep, and any other kind default to broadcast (the translator rejects
     # kinds it cannot handle before it ever inspects routing).
     return Broadcast()
@@ -83,6 +87,8 @@ def _default_aggregation(kind: str) -> AggregationPattern:
         return StitchPipeline()
     if kind in ("dp", "ep"):
         return Union()
+    if kind in ("sp_ulysses", "sp_ring"):
+        return GatherDim(dim=1)
     return TakeRank()
 
 

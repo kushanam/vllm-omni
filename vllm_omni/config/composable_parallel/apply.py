@@ -159,6 +159,8 @@ def check_device_layout(
     pipeline_parallel_size: int,
     num_replicas: int,
     role: RoleKey,
+    sp_ulysses_size: int = 1,
+    sp_ring_size: int = 1,
 ) -> None:
     """Validate a stage's device count against its world size (× replicas in pool mode).
 
@@ -166,11 +168,21 @@ def check_device_layout(
     neither the per-replica world size nor the full ``num_replicas`` pool.
     Exposed publicly so the resolved (post-CLI) layout can be re-checked after
     later override layers, not just the strategy-derived snapshot.
+
+    Sequence-parallel degrees (``sp_ulysses_size`` / ``sp_ring_size``) are real
+    world dimensions and multiply the per-replica device count, e.g.
+    ``[TP(4), SP_Ulysses(2)]`` needs 8 devices per replica.
     """
     count = _parse_device_count(devices)
     if count is None:
         return
-    world = int(tensor_parallel_size) * int(data_parallel_size) * int(pipeline_parallel_size)
+    world = (
+        int(tensor_parallel_size)
+        * int(data_parallel_size)
+        * int(pipeline_parallel_size)
+        * int(sp_ulysses_size)
+        * int(sp_ring_size)
+    )
     replicas = int(num_replicas or 1)
     # Two valid shapes: a single per-replica template (== world) or the full
     # pool across replicas (== replicas * world). This mirrors omni's own
@@ -179,7 +191,8 @@ def check_device_layout(
     if count not in valid:
         _fail(
             f"role {role!r}: declared {count} device id(s) but the strategy world size is {world} "
-            f"(tp={tensor_parallel_size} * dp={data_parallel_size} * pp={pipeline_parallel_size}). "
+            f"(tp={tensor_parallel_size} * dp={data_parallel_size} * pp={pipeline_parallel_size} * "
+            f"sp_ulysses={sp_ulysses_size} * sp_ring={sp_ring_size}). "
             f"Provide either {world} (per-replica template) or {replicas * world} "
             f"(num_replicas={replicas} pool)."
         )
@@ -194,7 +207,53 @@ def _check_devices(runtime: dict[str, Any], cfg: OmniParallelConfig, *, role: Ro
         pipeline_parallel_size=cfg.pipeline_parallel_size,
         num_replicas=int(runtime.get("num_replicas", 1) or 1),
         role=role,
+        sp_ulysses_size=cfg.sp_ulysses_size,
+        sp_ring_size=cfg.sp_ring_size,
     )
+
+
+def _set_sp_parallel_config(
+    engine_args: dict[str, Any],
+    cfg: OmniParallelConfig,
+    declared: set,
+    *,
+    role: RoleKey,
+) -> None:
+    """Overlay sequence-parallel degrees onto a (diffusion) stage's engine args.
+
+    The diffusion engine consumes SP through a nested ``parallel_config`` with
+    ``ulysses_degree`` / ``ring_degree`` and the derived
+    ``sequence_parallel_size = ulysses * ring``. We write that nested form
+    directly (rather than relying on the CLI runtime-override mover) because the
+    strategy overlay runs before CLI overrides are merged. Conflict-on-explicit
+    applies against both any nested ``parallel_config`` value and a top-level
+    field of the same name in the deploy YAML.
+    """
+    if "sp_ulysses" not in declared and "sp_ring" not in declared:
+        return
+
+    existing_pc = engine_args.get("parallel_config")
+    pc: dict[str, Any] = dict(existing_pc) if isinstance(existing_pc, Mapping) else {}
+
+    def _set_sp_field(field_name: str, value: int) -> None:
+        for container in (engine_args, pc):
+            current = container.get(field_name)
+            if current is not None and current != value:
+                _fail(
+                    f"role {role!r}: strategy derives {field_name}={value} but the deploy config "
+                    f"already set {field_name}={current}. Remove one of them (the strategy is the "
+                    "single writer for the axes it declares)."
+                )
+        pc[field_name] = value
+
+    if "sp_ulysses" in declared:
+        _set_sp_field("ulysses_degree", cfg.sp_ulysses_size)
+    if "sp_ring" in declared:
+        _set_sp_field("ring_degree", cfg.sp_ring_size)
+    # Always pin the derived total so the diffusion worker sizes its SP group
+    # consistently, regardless of which SP axes were declared.
+    _set_sp_field("sequence_parallel_size", cfg.sequence_parallel_size)
+    engine_args["parallel_config"] = pc
 
 
 def _apply_to_stage(stage: Any, cfg: OmniParallelConfig, *, role: RoleKey) -> None:
@@ -209,6 +268,7 @@ def _apply_to_stage(stage: Any, cfg: OmniParallelConfig, *, role: RoleKey) -> No
         _set_explicit(engine_args, "enable_expert_parallel", True, role=role)
     if "stage_replica" in declared:
         _set_num_replicas(runtime, cfg.stage_replica_size, role=role)
+    _set_sp_parallel_config(engine_args, cfg, declared, role=role)
 
     _check_devices(runtime, cfg, role=role)
 

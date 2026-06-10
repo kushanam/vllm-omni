@@ -12,10 +12,10 @@ The mesh-axis kinds below enumerate every parallelism dimension the contract can
 describe. Only a subset is wired end-to-end today (see ``translator.py``):
 
 * **Wired** (translatable now): ``tp``, ``dp``, ``pp``, ``ep``,
-  ``stage_replica``.
+  ``stage_replica``, ``sp_ulysses``, ``sp_ring``.
 * **Reserved** (declared in the type system but not yet translatable — the
-  translator raises ``AxisTranslationError`` for them): ``sp_ulysses``,
-  ``sp_ring``, ``cfg``, ``vae_pp``, ``hsdp``, ``stage_pp``, ``cp``.
+  translator raises ``AxisTranslationError`` for them): ``cfg``,
+  ``vae_pp``, ``hsdp``, ``stage_pp``, ``cp``.
 
 Reserved kinds fail fast at translation time rather than silently doing nothing,
 so declaring one is an explicit "not yet" rather than a no-op.

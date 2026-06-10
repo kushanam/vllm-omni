@@ -12,10 +12,12 @@ from vllm_omni.config.composable_parallel import (
     AxisTranslationError,
     Broadcast,
     FanInByStage,
+    GatherDim,
     MeshAxisSpec,
     PartitionByHash,
     PipelineMicrobatch,
     RouteByStage,
+    ShardSequence,
     StrategySpec,
     TakeRank,
     Union,
@@ -44,6 +46,14 @@ def _ep(size: int) -> StrategySpec:
 
 def _stage_replica(size: int, policy: str = "round_robin") -> StrategySpec:
     return StrategySpec("stage_replica", MeshAxisSpec("stage_replica", size), RouteByStage(policy), FanInByStage())
+
+
+def _sp_ulysses(size: int) -> StrategySpec:
+    return StrategySpec("sp_ulysses", MeshAxisSpec("sp_ulysses", size), ShardSequence(dim=1), GatherDim(dim=1))
+
+
+def _sp_ring(size: int) -> StrategySpec:
+    return StrategySpec("sp_ring", MeshAxisSpec("sp_ring", size), ShardSequence(dim=1), GatherDim(dim=1))
 
 
 def test_tp_only():
@@ -115,7 +125,74 @@ def test_duplicate_kind_rejected():
 
 
 def test_unsupported_kind_rejected():
-    spec = StrategySpec("sp", MeshAxisSpec("sp_ulysses", 2), Broadcast(), TakeRank())
+    # ``cp`` (context parallel) is still reserved — not translatable yet.
+    spec = StrategySpec("cp", MeshAxisSpec("cp", 2), Broadcast(), TakeRank())
+    with pytest.raises(AxisTranslationError):
+        translate_strategy_stack([spec])
+
+
+def test_sp_ulysses_only():
+    cfg = translate_strategy_stack([_sp_ulysses(2)])
+    assert cfg.sp_ulysses_size == 2
+    assert cfg.sp_ring_size == 1
+    # SP is a real world dimension.
+    assert cfg.world_size == 2
+    assert cfg.sequence_parallel_size == 2
+    assert cfg.l1_owners["sp_ulysses"] == "engine"
+    # Maps onto the diffusion engine's ulysses_degree field.
+    assert cfg.as_engine_kwargs()["ulysses_degree"] == 2
+    assert "ring_degree" not in cfg.as_engine_kwargs()
+
+
+def test_sp_ring_only():
+    cfg = translate_strategy_stack([_sp_ring(4)])
+    assert cfg.sp_ring_size == 4
+    assert cfg.world_size == 4
+    assert cfg.sequence_parallel_size == 4
+    assert cfg.as_engine_kwargs()["ring_degree"] == 4
+    assert "ulysses_degree" not in cfg.as_engine_kwargs()
+
+
+def test_tp_times_sp_ulysses_world_size():
+    # The design's first multi-axis composition: [TP(4), SP_Ulysses(2)] = 8 ranks.
+    cfg = translate_strategy_stack([_tp(4), _sp_ulysses(2)])
+    assert cfg.tensor_parallel_size == 4
+    assert cfg.sp_ulysses_size == 2
+    assert cfg.world_size == 8
+    kwargs = cfg.as_engine_kwargs()
+    assert kwargs["tensor_parallel_size"] == 4
+    assert kwargs["ulysses_degree"] == 2
+
+
+def test_sp_ulysses_times_sp_ring_world_size():
+    cfg = translate_strategy_stack([_sp_ulysses(2), _sp_ring(2)])
+    assert cfg.sp_ulysses_size == 2
+    assert cfg.sp_ring_size == 2
+    assert cfg.world_size == 4
+    assert cfg.sequence_parallel_size == 4
+
+
+def test_sp_size_one_emits_no_engine_kwarg():
+    cfg = translate_strategy_stack([_sp_ulysses(1)])
+    assert cfg.sp_ulysses_size == 1
+    # A degenerate degree of 1 should not emit a (no-op) ulysses_degree=1.
+    assert "ulysses_degree" not in cfg.as_engine_kwargs()
+
+
+def test_sp_wrong_routing_rejected():
+    spec = StrategySpec("sp_ulysses", MeshAxisSpec("sp_ulysses", 2), Broadcast(), GatherDim())
+    with pytest.raises(AxisTranslationError):
+        translate_strategy_stack([spec])
+
+
+def test_sp_wrong_owner_rejected():
+    spec = StrategySpec(
+        "sp_ulysses",
+        MeshAxisSpec("sp_ulysses", 2),
+        ShardSequence(dim=1),
+        GatherDim(dim=1),
+        shard_extension={"l1_owner": "delegated"},
+    )
     with pytest.raises(AxisTranslationError):
         translate_strategy_stack([spec])
 

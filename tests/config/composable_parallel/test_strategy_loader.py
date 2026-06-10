@@ -6,7 +6,8 @@ from __future__ import annotations
 
 import pytest
 
-from vllm_omni.config.composable_parallel.routing import Broadcast, RouteByStage
+from vllm_omni.config.composable_parallel.aggregation import GatherDim
+from vllm_omni.config.composable_parallel.routing import Broadcast, RouteByStage, ShardSequence
 from vllm_omni.config.composable_parallel.strategy_loader import (
     StrategyLoadError,
     load_strategy_specs,
@@ -35,6 +36,30 @@ def test_parse_basic():
     assert sr_spec.mesh_axis.kind == "stage_replica"
     assert isinstance(sr_spec.routing, RouteByStage)
     assert sr_spec.routing.routing_policy == "round_robin"
+
+
+def test_parse_sp_ulysses_defaults():
+    # An sp_ulysses axis needs only axis+size; routing defaults to ShardSequence
+    # and aggregation to GatherDim.
+    specs = parse_strategy_specs({"dit": [{"axis": "sp_ulysses", "size": 2}]})
+    (spec,) = specs["dit"]
+    assert spec.mesh_axis.kind == "sp_ulysses"
+    assert spec.mesh_axis.size == 2
+    assert isinstance(spec.routing, ShardSequence)
+    assert isinstance(spec.aggregation, GatherDim)
+
+
+def test_parse_sp_ring_defaults():
+    specs = parse_strategy_specs({"dit": [{"axis": "sp_ring", "size": 4}]})
+    (spec,) = specs["dit"]
+    assert isinstance(spec.routing, ShardSequence)
+    assert isinstance(spec.aggregation, GatherDim)
+
+
+def test_routing_policy_on_sp_axis_raises():
+    # sp_ulysses is not a stage-policy axis, so a 'routing' policy is rejected.
+    with pytest.raises(StrategyLoadError):
+        parse_strategy_specs({"dit": [{"axis": "sp_ulysses", "size": 2, "routing": "round_robin"}]})
 
 
 def test_parse_without_strategies_key():

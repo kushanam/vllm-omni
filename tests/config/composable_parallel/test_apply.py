@@ -9,14 +9,16 @@ import pytest
 from vllm_omni.config.composable_parallel import (
     Broadcast,
     FanInByStage,
+    GatherDim,
     MeshAxisSpec,
     RouteByStage,
     StrategyApplyError,
+    ShardSequence,
     StrategySpec,
     TakeRank,
     apply_strategy_specs,
 )
-from vllm_omni.config.stage_config import StageConfig
+from vllm_omni.config.stage_config import StageConfig, StageType
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -27,6 +29,14 @@ def _tp(size: int) -> StrategySpec:
 
 def _stage_replica(size: int, policy: str = "round_robin") -> StrategySpec:
     return StrategySpec("stage_replica", MeshAxisSpec("stage_replica", size), RouteByStage(policy), FanInByStage())
+
+
+def _sp_ulysses(size: int) -> StrategySpec:
+    return StrategySpec("sp_ulysses", MeshAxisSpec("sp_ulysses", size), ShardSequence(dim=1), GatherDim(dim=1))
+
+
+def _sp_ring(size: int) -> StrategySpec:
+    return StrategySpec("sp_ring", MeshAxisSpec("sp_ring", size), ShardSequence(dim=1), GatherDim(dim=1))
 
 
 def _stage(stage_id: int, model_stage: str, engine_args=None, runtime=None) -> StageConfig:
@@ -152,3 +162,65 @@ def test_conflicting_lb_policy_across_roles():
                 "code2wav": [_stage_replica(2, "least_queue")],
             },
         )
+
+
+# --- Sequence parallelism (sp_ulysses / sp_ring) ---
+
+
+def _diffusion_stage(stage_id: int, model_stage: str, engine_args=None, runtime=None) -> StageConfig:
+    return StageConfig(
+        stage_id=stage_id,
+        model_stage=model_stage,
+        stage_type=StageType.DIFFUSION,
+        yaml_engine_args=dict(engine_args or {}),
+        yaml_runtime=dict(runtime or {"num_replicas": 1}),
+    )
+
+
+def test_apply_sp_ulysses_writes_parallel_config():
+    stage = _diffusion_stage(0, "dit")
+    apply_strategy_specs([stage], {"dit": [_sp_ulysses(2)]})
+    pc = stage.yaml_engine_args["parallel_config"]
+    assert pc["ulysses_degree"] == 2
+    assert pc["sequence_parallel_size"] == 2
+    assert "ring_degree" not in pc
+
+
+def test_apply_sp_ulysses_ring_derives_sequence_parallel_size():
+    stage = _diffusion_stage(0, "dit")
+    apply_strategy_specs([stage], {"dit": [_sp_ulysses(2), _sp_ring(2)]})
+    pc = stage.yaml_engine_args["parallel_config"]
+    assert pc["ulysses_degree"] == 2
+    assert pc["ring_degree"] == 2
+    assert pc["sequence_parallel_size"] == 4
+
+
+def test_sp_device_count_includes_sp():
+    # [TP(2), SP_Ulysses(2)] -> world 4; 4 device ids is valid.
+    stage = _diffusion_stage(0, "dit", runtime={"num_replicas": 1, "devices": "0,1,2,3"})
+    apply_strategy_specs([stage], {"dit": [_tp(2), _sp_ulysses(2)]})
+    assert stage.yaml_engine_args["parallel_config"]["ulysses_degree"] == 2
+
+
+def test_sp_device_count_mismatch():
+    stage = _diffusion_stage(0, "dit", runtime={"num_replicas": 1, "devices": "0,1"})
+    with pytest.raises(StrategyApplyError):
+        apply_strategy_specs([stage], {"dit": [_tp(2), _sp_ulysses(2)]})
+
+
+def test_sp_conflict_on_explicit_parallel_config():
+    stage = _diffusion_stage(0, "dit", engine_args={"parallel_config": {"ulysses_degree": 4}})
+    with pytest.raises(StrategyApplyError):
+        apply_strategy_specs([stage], {"dit": [_sp_ulysses(2)]})
+
+
+def test_sp_reaches_diffusion_parallel_config_via_to_omegaconf():
+    # End-to-end config-layer check (no GPU): the strategy-derived SP degrees
+    # must survive into the resolved diffusion engine args that the worker reads.
+    stage = _diffusion_stage(0, "dit", runtime={"num_replicas": 1, "devices": "0,1"})
+    apply_strategy_specs([stage], {"dit": [_sp_ulysses(2)]})
+    resolved = stage.to_omegaconf()
+    # to_omegaconf() nests the engine args under "engine_args".
+    pc = resolved["engine_args"]["parallel_config"]
+    assert pc["ulysses_degree"] == 2
+    assert pc["sequence_parallel_size"] == 2

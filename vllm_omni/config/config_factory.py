@@ -305,6 +305,28 @@ class StageConfigFactory:
                         cfg.stage_replica_size,
                     )
 
+            # Sequence-parallel axes arrive via the diffusion ``ulysses_degree`` /
+            # ``ring_degree`` overrides; warn if a CLI value diverges from the
+            # strategy-derived degree, mirroring the tp/dp/pp behavior above.
+            sp_fields = {
+                "sp_ulysses": ("ulysses_degree", "sp_ulysses_size"),
+                "sp_ring": ("ring_degree", "sp_ring_size"),
+            }
+            for kind, (field_name, attr) in sp_fields.items():
+                if kind in declared and overrides.get(field_name) is not None:
+                    cli_val = overrides[field_name]
+                    derived = getattr(cfg, attr)
+                    if cli_val != derived:
+                        logger.warning(
+                            "[composable_parallel] stage %s: CLI %s=%s overrides the "
+                            "strategy-derived %s=%s. The CLI value wins; remove one to avoid ambiguity.",
+                            stage.stage_id,
+                            field_name,
+                            cli_val,
+                            field_name,
+                            derived,
+                        )
+
             def _eff(field_name: str, fallback: Any) -> Any:
                 val = overrides.get(field_name)
                 return val if val is not None else fallback
@@ -323,6 +345,8 @@ class StageConfigFactory:
                 pipeline_parallel_size=_eff_degree("pipeline_parallel_size", stage.yaml_engine_args),
                 num_replicas=_eff_degree("num_replicas", stage.yaml_runtime),
                 role=stage.model_stage,
+                sp_ulysses_size=int(_eff("ulysses_degree", cfg.sp_ulysses_size) or 1),
+                sp_ring_size=int(_eff("ring_degree", cfg.sp_ring_size) or 1),
             )
 
     @classmethod
