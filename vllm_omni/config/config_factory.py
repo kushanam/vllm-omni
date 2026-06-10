@@ -5,9 +5,10 @@
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from transformers import PretrainedConfig
 from vllm.logger import init_logger
@@ -292,9 +293,15 @@ class StageConfigFactory:
 
             check_device_layout(
                 _eff("devices", stage.yaml_runtime.get("devices")),
-                tensor_parallel_size=int(_eff("tensor_parallel_size", stage.yaml_engine_args.get("tensor_parallel_size", 1)) or 1),
-                data_parallel_size=int(_eff("data_parallel_size", stage.yaml_engine_args.get("data_parallel_size", 1)) or 1),
-                pipeline_parallel_size=int(_eff("pipeline_parallel_size", stage.yaml_engine_args.get("pipeline_parallel_size", 1)) or 1),
+                tensor_parallel_size=int(
+                    _eff("tensor_parallel_size", stage.yaml_engine_args.get("tensor_parallel_size", 1)) or 1
+                ),
+                data_parallel_size=int(
+                    _eff("data_parallel_size", stage.yaml_engine_args.get("data_parallel_size", 1)) or 1
+                ),
+                pipeline_parallel_size=int(
+                    _eff("pipeline_parallel_size", stage.yaml_engine_args.get("pipeline_parallel_size", 1)) or 1
+                ),
                 num_replicas=int(_eff("num_replicas", stage.yaml_runtime.get("num_replicas", 1)) or 1),
                 role=stage.model_stage,
             )
