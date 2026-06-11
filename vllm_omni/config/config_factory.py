@@ -235,9 +235,15 @@ class StageConfigFactory:
         """
         if not strategy_specs:
             return None
-        from vllm_omni.config.composable_parallel import apply_strategy_specs
+        from vllm_omni.config.composable_parallel.modules.orchestrator import (
+            Orchestrator,
+        )
 
-        applied = apply_strategy_specs(stages, strategy_specs)
+        result = Orchestrator().lower_and_plan(stages, strategy_specs)
+        # strategy_specs is truthy here, so lower_and_plan never returns None;
+        # the assert narrows the type and documents the invariant.
+        assert result is not None
+        applied = result.apply_result  # byte-identical to the legacy path
         if applied.omni_lb_policy is not None:
             logger.info(
                 "[composable_parallel] strategy derived omni_lb_policy=%r; it will be applied "

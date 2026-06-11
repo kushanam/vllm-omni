@@ -10,7 +10,6 @@ from vllm.model_executor.models.registry import _LazyRegisteredModel, _ModelRegi
 
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeMixin
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig, get_sp_plan_from_model
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.hooks.sequence_parallel import apply_sequence_parallel
@@ -368,29 +367,25 @@ def initialize_model(
         with set_current_diffusion_config(od_config):
             model = model_class(od_config=od_config)
 
-        vae_pp_size = od_config.parallel_config.vae_patch_parallel_size
-        is_distributed_vae = hasattr(model, "vae") and isinstance(model.vae, DistributedVaeMixin)
-        if vae_pp_size > 1 and not is_distributed_vae:
-            logger.warning(
-                "vae_patch_parallel_size=%d is set but VAE patch parallelism is NOT enabled for %s; ignoring.",
-                vae_pp_size,
-                od_config.model_class_name,
-            )
-        if vae_pp_size > 1 and is_distributed_vae and not od_config.vae_use_tiling:
-            logger.info(
-                "vae_patch_parallel_size=%d requires vae_use_tiling; automatically enabling it.",
-                vae_pp_size,
-            )
-            od_config.vae_use_tiling = True
+        # VAE patch parallelism, now routed through the module. apply() owns the
+        # full vae_pp block (warning + vae_use_tiling auto-enable + set_parallel_size)
+        # and runs BEFORE the use_slicing/use_tiling memory-optimization lines so
+        # the auto-enabled vae_use_tiling value is what gets written (§4.2).
+        # Imported locally to avoid an import-time cycle.
+        from vllm_omni.config.composable_parallel.modules.axes.vae_pp import (
+            VaePatchParallelStrategy,
+        )
+        from vllm_omni.config.composable_parallel.modules.base import ApplyCtx
 
-        # Configure VAE memory optimization settings from config
+        VaePatchParallelStrategy(
+            od_config.parallel_config.vae_patch_parallel_size
+        ).apply(ApplyCtx(model=model, od_config=od_config))
+
+        # Configure VAE memory optimization settings from config (not VAE-PP)
         if hasattr(model, "vae") and hasattr(model.vae, "use_slicing"):
             model.vae.use_slicing = od_config.vae_use_slicing
         if hasattr(model, "vae") and hasattr(model.vae, "use_tiling"):
             model.vae.use_tiling = od_config.vae_use_tiling
-
-        if is_distributed_vae:
-            model.vae.set_parallel_size(vae_pp_size)
 
         # Apply sequence parallelism if enabled
         # This follows diffusers' pattern where enable_parallelism() is called

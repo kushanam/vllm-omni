@@ -31,6 +31,18 @@ from vllm_omni.config.composable_parallel.apply import (
     apply_strategy_specs,
     check_device_layout,
 )
+from vllm_omni.config.composable_parallel.modules import (
+    ApplyCtx,
+    AxisName,
+    AxisPlan,
+    AxisResult,
+    DelegatedStrategy,
+    GroupBuildCtx,
+    GroupHandle,
+    LoweringCtx,
+    OmniExecutedStrategy,
+    StrategyModule,
+)
 from vllm_omni.config.composable_parallel.routing import (
     ROUTING_PATTERN_VARIANTS,
     Broadcast,
@@ -101,4 +113,15 @@ __all__ = [
     "StrategyApplyResult",
     "check_device_layout",
     "StrategyApplyError",
+    # module contract types
+    "AxisName",
+    "AxisPlan",
+    "GroupHandle",
+    "AxisResult",
+    "StrategyModule",
+    "OmniExecutedStrategy",
+    "DelegatedStrategy",
+    "LoweringCtx",
+    "GroupBuildCtx",
+    "ApplyCtx",
 ]
