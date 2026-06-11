@@ -8,6 +8,7 @@ Tests verify that SP inference produces correct outputs compared to baseline.
 """
 
 import gc
+import hashlib
 import os
 import sys
 import time
@@ -86,13 +87,22 @@ def _run_inference(
     width: int = DEFAULT_WIDTH,
     seed: int = DEFAULT_SEED,
     warmup: bool = True,
+    use_sp_descriptor: bool = False,
 ) -> InferenceResult:
     """Run inference with specified configuration.
 
     Args:
         warmup: If True, run one warmup iteration before the timed run.
+        use_sp_descriptor: Phase 1b flag. When True, SP hooks are wired from the
+            typed ``SPDescriptor`` declaration instead of the legacy ``_sp_plan``
+            dict. Threaded onto the constructed ``DiffusionParallelConfig`` so the
+            equivalence gate below can genuinely toggle the new path.
     """
-    parallel_config = DiffusionParallelConfig(ulysses_degree=ulysses_degree, ring_degree=ring_degree)
+    parallel_config = DiffusionParallelConfig(
+        ulysses_degree=ulysses_degree,
+        ring_degree=ring_degree,
+        use_sp_descriptor=use_sp_descriptor,
+    )
     try:
         with OmniRunner(
             model_name,
@@ -290,6 +300,90 @@ def test_sp_correctness(model_name: str):
             f"{baseline_str:<12} {r['sp_ms']:.0f}ms{'':<7} {speedup_str:<10} {status}"
         )
     print("=" * 70)
+
+
+# =============================================================================
+# Phase 1b: SPDescriptor flag-ON vs flag-OFF output-equivalence gate
+# =============================================================================
+
+
+def _image_sha256(img: Image.Image) -> str:
+    """Stable byte hash of an image's RGB pixels (the Phase-1 VAE-PP gate bar)."""
+    return hashlib.sha256(np.asarray(img.convert("RGB"), dtype=np.uint8).tobytes()).hexdigest()
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.parallel
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 2, "rocm": 2})
+@pytest.mark.parametrize("model_name", MODELS)
+def test_sp_descriptor_equivalence_gate(model_name: str):
+    """Prove the SPDescriptor path (flag ON) == the legacy ``_sp_plan`` path (OFF).
+
+    Runs the SAME QwenImage generation twice under identical SP degrees — once
+    with ``use_sp_descriptor=False`` (legacy ``_sp_plan`` -> apply_sequence_parallel)
+    and once with ``use_sp_descriptor=True`` (SPDescriptor.to_plan(model) ->
+    apply_sequence_parallel) — and asserts the outputs are byte-identical
+    (SHA256), the Phase-1 VAE-PP gate bar. If a nondeterministic kernel breaks
+    bit-equality, it falls back to the existing image-diff tolerance oracle and
+    surfaces the deviation.
+
+    This is the gate the REVISED Phase 1b spec requires: unlike a plain
+    ``USE_SP_DESCRIPTOR=... pytest`` (which the harness never reads), the flag is
+    genuinely toggled here on the constructed ``DiffusionParallelConfig``.
+
+    Run on the single assigned 2-GPU server terminal; the first run is warm-up.
+    """
+    device_count = current_omni_platform.get_device_count()
+    ulysses_degree, ring_degree = 2, 1
+    sp_size = ulysses_degree * ring_degree
+    if device_count < sp_size:
+        pytest.skip(f"requires {sp_size} GPUs, found {device_count}")
+
+    print("\n" + "=" * 70)
+    print(f"SPDescriptor equivalence gate - Model: {model_name} (ulysses={ulysses_degree})")
+    print("=" * 70)
+
+    legacy = _run_inference(
+        model_name,
+        torch.bfloat16,
+        "sdpa",
+        ulysses_degree=ulysses_degree,
+        ring_degree=ring_degree,
+        warmup=True,
+        use_sp_descriptor=False,
+    )
+    descriptor = _run_inference(
+        model_name,
+        torch.bfloat16,
+        "sdpa",
+        ulysses_degree=ulysses_degree,
+        ring_degree=ring_degree,
+        warmup=True,
+        use_sp_descriptor=True,
+    )
+    assert len(legacy.images) == 1 and len(descriptor.images) == 1
+
+    legacy_hash = _image_sha256(legacy.images[0])
+    descriptor_hash = _image_sha256(descriptor.images[0])
+    print(f"[legacy]     sha256={legacy_hash}")
+    print(f"[descriptor] sha256={descriptor_hash}")
+
+    if legacy_hash == descriptor_hash:
+        return  # byte-identical: the strongest pass
+
+    # Fallback: bit-equality may break on nondeterministic kernels even though
+    # both paths lower to the identical plan/hooks. Accept the existing tolerance
+    # oracle and document the deviation.
+    mean_diff, max_diff = _diff_metrics(legacy.images[0], descriptor.images[0])
+    print(
+        f"[gate] sha256 mismatch; falling back to tolerance oracle: "
+        f"mean={mean_diff:.6e}, max={max_diff:.6e}"
+    )
+    assert mean_diff <= DIFF_MEAN_THRESHOLD and max_diff <= DIFF_MAX_THRESHOLD, (
+        f"SPDescriptor (flag ON) output differs from legacy (flag OFF): "
+        f"mean={mean_diff:.6e}, max={max_diff:.6e}"
+    )
 
 
 # TODO: After PR#1272 is merged, add markers

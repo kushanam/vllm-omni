@@ -160,7 +160,10 @@ def _module_engine_kwargs(plans) -> dict:
 # (it is applied as ulysses_degree/ring_degree engine kwargs) YET owned_by="omni"
 # (omni's diffusion engine executes it; vLLM core does not). The two must NOT be
 # equated — that conflation is exactly the defect this assertion guards against.
-_CONTRACT_OWNED_BY = {
+# ``tp`` / ``ep`` ownership is execution-type-aware (REVIEW_PHASE1_IMPL
+# §SHOULD-FIX 1): omni-executed on diffusion stages, delegated to vLLM on AR
+# stages. The other axes are execution-type-invariant.
+_CONTRACT_OWNED_BY_AR = {
     "tp": "vllm",
     "dp": "vllm",
     "pp": "vllm",
@@ -170,6 +173,7 @@ _CONTRACT_OWNED_BY = {
     "stage_replica": "omni",
     "vae_pp": "omni",
 }
+_CONTRACT_OWNED_BY_DIFFUSION = {**_CONTRACT_OWNED_BY_AR, "tp": "omni", "ep": "omni"}
 
 # The translator's ``l1_owner`` is a SEPARATE, unchanged property of the
 # translator output (not of the module ``owned_by``). Asserted independently.
@@ -184,7 +188,12 @@ _TRANSLATOR_L1_OWNER = {
 }
 
 
-def _assert_module_view_matches(result) -> None:
+def _diffusion_roles(stages: list[StageConfig]) -> set:
+    """Roles whose stage is a diffusion stage (execution-type-aware ownership)."""
+    return {s.model_stage for s in stages if StageType(s.stage_type) == StageType.DIFFUSION}
+
+
+def _assert_module_view_matches(result, diffusion_roles: set) -> None:
     """Aggregate of module plans reproduces per_role_config[role] (§5.2).
 
     Two DISTINCT checks, deliberately kept separate:
@@ -201,6 +210,9 @@ def _assert_module_view_matches(result) -> None:
     for role, cfg in apply_result.per_role_config.items():
         plans = result.plans_by_role[role]
         by_axis = {p.axis: p for p in plans}
+        owned_by_table = (
+            _CONTRACT_OWNED_BY_DIFFUSION if role in diffusion_roles else _CONTRACT_OWNED_BY_AR
+        )
 
         # (1) engine_kwargs aggregate == translator as_engine_kwargs.
         assert _module_engine_kwargs(plans) == dict(cfg.as_engine_kwargs())
@@ -229,7 +241,7 @@ def _assert_module_view_matches(result) -> None:
 
         # (2a) owned_by matches the CONTRACT table (who executes) — NOT l1_owner.
         for axis_name, plan in by_axis.items():
-            assert plan.owned_by == _CONTRACT_OWNED_BY[axis_name]
+            assert plan.owned_by == owned_by_table[axis_name]
 
         # (2b) SEPARATELY: the translator's l1_owner is its own unchanged
         # property ("engine"/"delegated"), orthogonal to the module owned_by.
@@ -282,7 +294,7 @@ def test_orchestrator_matches_baseline(case_id, make_stages, specs):
     assert applied.per_role_config == baseline.per_role_config
     assert applied.per_stage_config == baseline.per_stage_config
     # module-view aggregate reproduces per_role_config.
-    _assert_module_view_matches(result)
+    _assert_module_view_matches(result, _diffusion_roles(orch_stages))
 
 
 # --- failure matrix: same exception type AND message from both paths ---------

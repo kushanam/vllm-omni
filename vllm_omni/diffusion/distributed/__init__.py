@@ -11,6 +11,13 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_fully_shard_rank,
     get_fully_shard_world_size,
 )
+from vllm_omni.diffusion.distributed.sp_descriptor import (
+    GatherSpec,
+    SPDescriptor,
+    SPInternal,
+    SplitSpec,
+    split_outputs,
+)
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelConfig,
     SequenceParallelInput,
@@ -38,6 +45,12 @@ __all__ = [
     "SequenceParallelModelPlan",
     "validate_sp_plan",
     "get_sp_plan_from_model",
+    # SP typed declaration layer (Phase 1b)
+    "SPDescriptor",
+    "SplitSpec",
+    "GatherSpec",
+    "SPInternal",
+    "split_outputs",
     # Sharding utilities
     "sp_shard",
     "sp_gather",

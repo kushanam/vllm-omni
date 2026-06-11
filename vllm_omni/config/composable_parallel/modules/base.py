@@ -33,6 +33,26 @@ AxisName = Literal[
 
 OwnedBy = Literal["omni", "vllm"]
 
+
+def is_diffusion_execution(execution_type: object | None) -> bool:
+    """True iff a stage's execution type marks it as a diffusion stage.
+
+    Used by execution-type-sensitive axis modules (``tp`` / ``ep``) to decide
+    ownership: diffusion ``tp`` / ``ep`` are omni-executed, whereas AR ``tp`` /
+    ``ep`` are delegated to vLLM core (``REVIEW_PHASE1_IMPL`` §SHOULD-FIX 1).
+
+    Compares by the enum *value* string (``"diffusion"``) to stay torch-free and
+    avoid importing the heavy ``stage_config`` module into the ``plan()`` path.
+    This matches both ``StageExecutionType.DIFFUSION`` and the legacy
+    ``StageType.DIFFUSION`` (their values are identical). ``None`` (no signal,
+    e.g. a caller that does not thread execution type) defaults to non-diffusion,
+    preserving the pre-1b AR/delegate behavior.
+    """
+    if execution_type is None:
+        return False
+    return getattr(execution_type, "value", execution_type) == "diffusion"
+
+
 # ---------------------------------------------------------------------------
 # Carriers
 # ---------------------------------------------------------------------------

@@ -422,6 +422,11 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
         transformer_attrs = ["transformer", "transformer_2", "dit", "unet"]
         applied_count = 0
 
+        # Phase 1b single divergence point: the typed SPDescriptor path vs the
+        # legacy free-form `_sp_plan` path. Default (False) runs the exact legacy
+        # branch below, so output is byte-identical to the pre-1b behavior.
+        use_descriptor = getattr(od_config.parallel_config, "use_sp_descriptor", False)
+
         for attr in transformer_attrs:
             if not hasattr(model, attr):
                 # Some pipeline like LTX2TwoStagesPipeline have recursive
@@ -435,6 +440,34 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
             if transformer is None:
                 continue
 
+            if use_descriptor:
+                # Typed-descriptor path: SPInternal (Mechanism B) or a model with
+                # no descriptor registers no hooks (applied=False); an
+                # SPDescriptor expands to the same plan the legacy path uses.
+                from vllm_omni.diffusion.hooks.sequence_parallel import (
+                    apply_sequence_parallel_from_descriptor,
+                )
+
+                sp_config = SequenceParallelConfig(
+                    ulysses_degree=od_config.parallel_config.ulysses_degree,
+                    ring_degree=od_config.parallel_config.ring_degree,
+                )
+                applied = apply_sequence_parallel_from_descriptor(transformer, sp_config)
+                if applied:
+                    mode = (
+                        "hybrid"
+                        if sp_config.ulysses_degree > 1 and sp_config.ring_degree > 1
+                        else ("ulysses" if sp_config.ulysses_degree > 1 else "ring")
+                    )
+                    logger.info(
+                        f"Applying sequence parallelism to {transformer.__class__.__name__} ({attr}) "
+                        f"via SPDescriptor (sp_size={sp_size}, mode={mode}, "
+                        f"ulysses={sp_config.ulysses_degree}, ring={sp_config.ring_degree})"
+                    )
+                    applied_count += 1
+                continue
+
+            # ---- legacy path (unchanged; byte-identical when flag is OFF) ----
             plan = get_sp_plan_from_model(transformer)
             if plan is None:
                 continue

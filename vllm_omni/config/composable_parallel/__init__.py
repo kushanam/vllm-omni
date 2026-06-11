@@ -68,6 +68,7 @@ from vllm_omni.config.composable_parallel.spec import (
 from vllm_omni.config.composable_parallel.translator import (
     AxisTranslationError,
     OmniParallelConfig,
+    UnmappedAxisError,
     translate_strategy_stack,
 )
 
@@ -108,6 +109,7 @@ __all__ = [
     "OmniParallelConfig",
     "translate_strategy_stack",
     "AxisTranslationError",
+    "UnmappedAxisError",
     # apply
     "apply_strategy_specs",
     "StrategyApplyResult",

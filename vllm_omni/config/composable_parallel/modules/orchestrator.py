@@ -23,6 +23,7 @@ from typing import Any
 
 from vllm_omni.config.composable_parallel.apply import (
     StrategyApplyResult,
+    _resolve_stage,
     apply_strategy_specs,
 )
 from vllm_omni.config.composable_parallel.modules.axes import (
@@ -39,7 +40,10 @@ from vllm_omni.config.composable_parallel.modules.base import (
     LoweringCtx,
     StrategyModule,
 )
-from vllm_omni.config.composable_parallel.translator import _STAGE_POLICY_TO_OMNI_LB
+from vllm_omni.config.composable_parallel.translator import (
+    _STAGE_POLICY_TO_OMNI_LB,
+    UnmappedAxisError,
+)
 
 StrategyPlan = list[StrategyModule]
 
@@ -76,6 +80,24 @@ def _build_module(spec: Any) -> StrategyModule:
     return _MODULE_BY_KIND[kind](size)
 
 
+def _stage_execution_type(stage: Any) -> object | None:
+    """Resolve a stage's execution type for the module-view ownership decision.
+
+    Prefers an explicit ``execution_type`` (newer resolved stage configs); else
+    derives it from the legacy ``stage_type`` (DIFFUSION -> diffusion execution,
+    everything else -> AR). ``None`` when the stage carries no signal. Imported
+    lazily to keep this module's import graph light and cycle-free.
+    """
+    et = getattr(stage, "execution_type", None)
+    if et is not None:
+        return et
+    from vllm_omni.config.stage_config import StageExecutionType, StageType
+
+    if getattr(stage, "stage_type", None) == StageType.DIFFUSION:
+        return StageExecutionType.DIFFUSION
+    return StageExecutionType.LLM_AR
+
+
 class Orchestrator:
     def lower_and_plan(
         self,
@@ -98,29 +120,42 @@ class Orchestrator:
         if not strategy_specs:
             return None
         apply_result = apply_strategy_specs(stages, strategy_specs)
-        modules_by_role, plans_by_role = self._build_module_view(strategy_specs)
+        modules_by_role, plans_by_role = self._build_module_view(stages, strategy_specs)
         return LowerAndPlanResult(apply_result, plans_by_role, modules_by_role)
 
     # --- module view (introspection / forward-compat); does NOT write stages ---
     def _build_module_view(
         self,
+        stages: list[Any],
         strategy_specs: Mapping[Any, Sequence[Any]],
     ) -> tuple[dict[Any, StrategyPlan], dict[Any, list[AxisPlan]]]:
         modules_by_role: dict[Any, StrategyPlan] = {}
         plans_by_role: dict[Any, list[AxisPlan]] = {}
         for role, specs in strategy_specs.items():
+            # Resolve the role's stage execution type so execution-type-sensitive
+            # axes (tp/ep) report faithful ownership (omni vs vLLM). Role->stage
+            # matching already succeeded in apply_strategy_specs above.
+            execution_type = _stage_execution_type(_resolve_stage(stages, role))
             modules: StrategyPlan = []
             plans: list[AxisPlan] = []
             for spec in specs:
                 kind = spec.mesh_axis.kind
-                # Only translatable kinds reach here: apply_strategy_specs (above)
-                # has already rejected reserved/unsupported kinds. Skip anything
-                # without a Phase-1 module rather than fabricating a view.
+                # apply_strategy_specs (above) already rejected reserved /
+                # unsupported kinds, so anything reaching here is translatable.
+                # A translatable kind with no module mapping is a developer error
+                # (a supported axis silently vanishing from the view), so FAIL
+                # LOUDLY rather than dropping it (REVIEW_PHASE1_IMPL §SHOULD-FIX 2).
                 if kind != "stage_replica" and kind not in _MODULE_BY_KIND:
-                    continue
+                    raise UnmappedAxisError(
+                        f"role {role!r}: axis kind {kind!r} was accepted by the "
+                        f"translator but has no StrategyModule mapping in "
+                        f"_MODULE_BY_KIND. Add a module for it or remove it from "
+                        f"the translator's supported kinds. (Phase 1b fail-loud, "
+                        f"REVIEW_PHASE1_IMPL §SHOULD-FIX 2.)"
+                    )
                 module = _build_module(spec)
                 modules.append(module)
-                plans.append(module.plan(LoweringCtx(spec=spec)))
+                plans.append(module.plan(LoweringCtx(spec=spec, execution_type=execution_type)))
             modules_by_role[role] = modules
             plans_by_role[role] = plans
         return modules_by_role, plans_by_role

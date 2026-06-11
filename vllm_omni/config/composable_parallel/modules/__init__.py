@@ -18,6 +18,7 @@ from vllm_omni.config.composable_parallel.modules.base import (
     OmniExecutedStrategy,
     OwnedBy,
     StrategyModule,
+    is_diffusion_execution,
 )
 
 __all__ = [
@@ -32,4 +33,5 @@ __all__ = [
     "StrategyModule",
     "OmniExecutedStrategy",
     "DelegatedStrategy",
+    "is_diffusion_execution",
 ]

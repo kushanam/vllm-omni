@@ -37,6 +37,11 @@ from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.base import CachedTransformer
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
+from vllm_omni.diffusion.distributed.sp_descriptor import (
+    GatherSpec,
+    SPDescriptor,
+    SplitSpec,
+)
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
@@ -955,6 +960,23 @@ class QwenImageTransformer2DModel(CachedTransformer):
         # Gather output at proj_out
         "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
     }
+
+    # Phase 1b: typed declaration of the SAME plan above. Consumed only when the
+    # SPDescriptor path is enabled (parallel_config.use_sp_descriptor=True);
+    # ``to_plan(model)`` deep-equals ``_sp_plan`` so the flag-ON path is
+    # byte-identical (locked by the descriptor↔legacy equivalence test). Note the
+    # per-index split_dim (idx0 dim=1 vs idx1 dim=0) and the conditional
+    # ``modulate_index_prepare`` split: the conditional is preserved because the
+    # descriptor compiles to the same plan and the live hook path already skips
+    # the ``(tensor, None)`` output of ModulateIndexPrepare when zero_cond_t=False.
+    _sp_descriptor = SPDescriptor(
+        splits=(
+            SplitSpec("image_rope_prepare", 0, split_dim=1, expected_dims=3, auto_pad=True),
+            SplitSpec("image_rope_prepare", 1, split_dim=0, expected_dims=2, auto_pad=True),
+            SplitSpec("modulate_index_prepare", 1, split_dim=1, expected_dims=2, auto_pad=True),
+        ),
+        gathers=(GatherSpec("proj_out", gather_dim=1, expected_dims=3),),
+    )
 
     def __init__(
         self,

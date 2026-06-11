@@ -649,6 +649,58 @@ def apply_sequence_parallel(
             registry.register_hook(hook_name, hook)
 
 
+def apply_sequence_parallel_from_descriptor(
+    model: nn.Module,
+    config: SequenceParallelConfig,
+) -> bool:
+    """Apply SP from a model's typed ``_sp_descriptor`` (Phase 1b front end).
+
+    Thin compile-to-dict entry point over the UNCHANGED runtime: it reads the
+    model's ``_sp_descriptor`` and dispatches on its kind, then calls the
+    existing :func:`apply_sequence_parallel` with a plan that is byte-identical
+    to the legacy ``_sp_plan`` dict.
+
+    - :class:`SPInternal` (Mechanism B, e.g. BAGEL): no hooks are registered;
+      SP lives inside ``forward()``. Returns ``False``.
+    - No ``_sp_descriptor`` attribute: fall back to the legacy ``_sp_plan`` dict
+      (back-compat during the multi-model migration). Returns ``False`` when the
+      model has neither.
+    - :class:`SPDescriptor`: expand ``to_plan(model)`` (== the legacy dict),
+      validate it with the existing validator, and apply.
+
+    Args:
+        model: the transformer to wire SP onto.
+        config: the sequence-parallel configuration.
+
+    Returns:
+        ``True`` iff SP hooks were actually registered on ``model``.
+    """
+    from vllm_omni.diffusion.distributed.sp_descriptor import SPDescriptor, SPInternal
+    from vllm_omni.diffusion.distributed.sp_plan import get_sp_plan_from_model, validate_sp_plan
+
+    desc = getattr(model, "_sp_descriptor", None)
+    if isinstance(desc, SPInternal):
+        # Mechanism B: SP is hand-written in forward(); register no hooks. The
+        # existing group builder still builds the _SP group the forward uses.
+        return False
+    if desc is None:
+        # Back-compat: a not-yet-migrated model still carries a legacy _sp_plan.
+        plan = get_sp_plan_from_model(model)
+        if plan is None:
+            return False
+    elif isinstance(desc, SPDescriptor):
+        plan = desc.to_plan(model)
+        validate_sp_plan(plan)
+    else:
+        raise TypeError(
+            f"_sp_descriptor on {model.__class__.__name__} must be an SPDescriptor or "
+            f"SPInternal, got {type(desc).__name__}."
+        )
+
+    apply_sequence_parallel(model, config, plan)
+    return True
+
+
 def remove_sequence_parallel(
     module: nn.Module,
     plan: SequenceParallelModelPlan,

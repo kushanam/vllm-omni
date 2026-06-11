@@ -200,6 +200,12 @@ class DiffusionParallelConfig:
     hsdp_replicate_size: int = 1
     """Number of replica groups for HSDP. Each replica holds a full sharded copy."""
 
+    use_sp_descriptor: bool = False
+    """Phase 1b: when True, sequence parallelism is wired from the typed
+    SPDescriptor / SPInternal declaration (vllm_omni.diffusion.distributed.
+    sp_descriptor) instead of the legacy free-form ``_sp_plan`` dict / manual-SP
+    path. Default False keeps the legacy path byte-identical."""
+
     @model_validator(mode="after")
     def _validate_parallel_config(self) -> Self:
         """Validates the config relationships among the parallel strategies."""

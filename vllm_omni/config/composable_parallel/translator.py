@@ -125,6 +125,17 @@ def _not_implemented(msg: str) -> NoReturn:
     raise NotImplementedError(msg)
 
 
+class UnmappedAxisError(AxisTranslationError):
+    """Raised when an axis kind is translatable but has no ``StrategyModule``.
+
+    The orchestrator's module-view builder must FAIL LOUDLY rather than silently
+    dropping an axis that ``apply_strategy_specs`` accepted (Phase 1b fail-loud,
+    ``REVIEW_PHASE1_IMPL`` §SHOULD-FIX 2). Subclassing
+    :class:`AxisTranslationError` keeps existing broad translator handlers
+    working while still allowing explicit ``UnmappedAxisError`` assertions.
+    """
+
+
 @dataclass(frozen=True)
 class OmniParallelConfig:
     """Result of translating a spec stack into omni parallel sizing."""

@@ -46,6 +46,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_sequence_parallel_rank,
     get_sp_group,
 )
+from vllm_omni.diffusion.distributed.sp_descriptor import SPInternal
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.layers.mot.mot_layernorm import MoTRMSNorm
 from vllm_omni.diffusion.layers.mot.mot_qkv_parallel_linear import MoTQKVParallelLinear
@@ -1257,6 +1258,15 @@ class Bagel(nn.Module):
     # (``num_timesteps + 1``) for ``num_timesteps`` steps; ``LanceBagel`` flips
     # this on. See https://github.com/vllm-project/vllm-omni/issues/4470.
     _denoise_schedule_extra_step: bool = False
+
+    # Phase 1b Mechanism-B marker: SP is hand-written inside forward() over the
+    # packed VAE-token axis (_split_vae_for_sp / _gather_vae_for_sp via
+    # get_sp_group()), which the boundary-hook mechanism cannot express. When the
+    # SPDescriptor path is enabled, the applier sees SPInternal and registers no
+    # hooks; the existing diffusion group builder still builds the _SP group the
+    # forward consumes. When the flag is OFF, BAGEL hits the same legacy no-plan
+    # branch as today — behavior is identical in both flag states.
+    _sp_descriptor = SPInternal("packed VAE-token split/gather in forward via get_sp_group()")
 
     def __init__(
         self,

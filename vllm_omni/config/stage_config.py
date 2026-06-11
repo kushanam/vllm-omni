@@ -341,6 +341,10 @@ class StageDeployConfig:
     use_hsdp: bool | None = None
     hsdp_shard_size: int | None = None
     hsdp_replicate_size: int | None = None
+    # Phase 1b: opt a stage into the typed SPDescriptor SP path. Mirrors
+    # DiffusionParallelConfig.use_sp_descriptor; the diffusion runtime-override
+    # mover copies it onto the nested parallel_config (it is a parallel field).
+    use_sp_descriptor: bool | None = None
 
     # Compilation, profiling, tokenizer/config parsing, and model loading.
     compilation_config: dict[str, Any] | None = None
