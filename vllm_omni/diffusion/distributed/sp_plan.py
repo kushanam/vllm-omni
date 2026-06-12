@@ -404,7 +404,15 @@ def validate_sp_plan(plan: SequenceParallelModelPlan) -> None:
         if isinstance(module_plan, SequenceParallelOutput):
             continue
         if isinstance(module_plan, (list, tuple)):
-            if all(isinstance(x, SequenceParallelOutput) for x in module_plan):
+            # Position-indexed output list. ``None`` placeholders mark output
+            # indices that are NOT gathered (e.g. a sparse multi-output gather
+            # produced by ``SPDescriptor.to_plan``); the runtime gather hook
+            # already skips them (see ``SequenceParallelGatherHook``), so the
+            # validator must accept them too. Require at least one real
+            # ``SequenceParallelOutput`` so an all-``None`` list is rejected.
+            if all(x is None or isinstance(x, SequenceParallelOutput) for x in module_plan) and any(
+                isinstance(x, SequenceParallelOutput) for x in module_plan
+            ):
                 continue
             if _is_valid_input_config_list(module_plan):
                 # List of inputs for a specific parameter (when output is tuple)

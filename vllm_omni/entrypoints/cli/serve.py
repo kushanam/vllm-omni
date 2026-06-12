@@ -473,6 +473,16 @@ class OmniServeCommand(CLISubcommand):
             "Equivalent to setting DiffusionParallelConfig.ring_degree.",
         )
         omni_config_group.add_argument(
+            "--use-sp-descriptor",
+            dest="use_sp_descriptor",
+            action="store_true",
+            help="Phase 1b: wire diffusion sequence parallelism from the typed "
+            "SPDescriptor / SPInternal declaration instead of the legacy "
+            "`_sp_plan` dict / manual-SP path. "
+            "Equivalent to setting DiffusionParallelConfig.use_sp_descriptor. "
+            "Default OFF keeps the legacy path byte-identical.",
+        )
+        omni_config_group.add_argument(
             "--diffusion-quantization-config",
             type=json.loads,
             default=None,

@@ -457,6 +457,10 @@ class OrchestratorArgs:
     ulysses_degree: int | None = None
     ulysses_mode: str = "strict"
     ring_degree: int | None = None
+    # Phase 1b: opt into the typed SPDescriptor SP path. Mirrors
+    # DiffusionParallelConfig.use_sp_descriptor; default OFF keeps the legacy
+    # `_sp_plan` path byte-identical.
+    use_sp_descriptor: bool = False
     diffusion_quantization_config: str | None = None
     use_hsdp: bool = False
     hsdp_shard_size: int = -1

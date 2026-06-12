@@ -78,6 +78,58 @@ def test_to_plan_multi_output_gather_is_position_indexed_list():
         None,
         SequenceParallelOutput(gather_dim=1, expected_dims=3),
     ]
+    # SHOULD-FIX (review): the sparse multi-output gather plan the compiler emits
+    # (with None holes) MUST pass the existing validator, since the runtime
+    # gather hook already accepts None placeholders. This assertion is what
+    # caught the to_plan()/validate_sp_plan() mismatch.
+    validate_sp_plan(plan)
+
+
+def test_to_plan_sparse_single_gather_at_nonzero_index_validates():
+    # A single gather at a non-zero index does NOT collapse to a bare output;
+    # it becomes [None, ..., out] with leading None holes and must validate.
+    desc = SPDescriptor(
+        gathers=(GatherSpec("proj_out", gather_dim=1, expected_dims=3, output_index=2),),
+    )
+    plan = desc.to_plan(model=None)
+    out = plan["proj_out"]
+    assert isinstance(out, list)
+    assert out == [None, None, SequenceParallelOutput(gather_dim=1, expected_dims=3)]
+    validate_sp_plan(plan)
+
+
+def test_validate_rejects_all_none_output_list():
+    # A degenerate output list with no real gather is malformed and must be
+    # rejected (guards the relaxed None-placeholder rule from over-accepting).
+    with pytest.raises(ValueError):
+        validate_sp_plan({"proj_out": [None, None]})
+
+
+def test_to_plan_mixed_split_and_gather_same_module_raises():
+    # NIT (review): user-facing validation must raise ValueError (not assert).
+    desc = SPDescriptor(
+        splits=(SplitSpec("blocks.0", 0, split_dim=1, expected_dims=3),),
+        gathers=(GatherSpec("blocks.0", gather_dim=1, expected_dims=3),),
+    )
+    with pytest.raises(ValueError, match="mixes split and gather"):
+        desc.to_plan(model=None)
+
+
+def test_to_plan_none_expected_dims_and_auto_pad_roundtrip():
+    # Edge cases: expected_dims=None (no runtime dim check) and auto_pad on a
+    # plain input split. Both must survive expansion and validate.
+    desc = SPDescriptor(
+        splits=(SplitSpec("", "hidden_states", split_dim=1, expected_dims=None, auto_pad=True),),
+        gathers=(GatherSpec("proj_out", gather_dim=1, expected_dims=None),),
+    )
+    plan = desc.to_plan(model=None)
+    inp = plan[""]["hidden_states"]
+    assert isinstance(inp, SequenceParallelInput)
+    assert inp.expected_dims is None
+    assert inp.auto_pad is True
+    assert inp.split_output is False
+    assert plan["proj_out"] == SequenceParallelOutput(gather_dim=1, expected_dims=None)
+    validate_sp_plan(plan)
 
 
 def test_to_plan_per_index_split_dim_preserved():

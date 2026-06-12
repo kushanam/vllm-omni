@@ -110,6 +110,48 @@ def test_default_stage_config_propagates_ulysses_mode():
     assert parallel_config.ulysses_mode == "advanced_uaa"
 
 
+def test_default_stage_config_propagates_use_sp_descriptor():
+    """MUST-FIX (review): a flat ``use_sp_descriptor`` engine arg (deploy YAML /
+    CLI / stage override) must reach ``DiffusionParallelConfig.use_sp_descriptor``
+    in the fallback parallel_config construction. Without this, a deploy-YAML/CLI
+    opt-in silently stayed OFF at runtime.
+    """
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "ulysses_degree": 2,
+            "use_sp_descriptor": True,
+        }
+    )[0]
+
+    parallel_config = stage_cfg["engine_args"]["parallel_config"]
+    assert parallel_config.use_sp_descriptor is True
+
+
+def test_default_stage_config_use_sp_descriptor_defaults_off():
+    """Default remains OFF (byte-identical legacy path) when unset."""
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "ulysses_degree": 2,
+        }
+    )[0]
+
+    parallel_config = stage_cfg["engine_args"]["parallel_config"]
+    assert parallel_config.use_sp_descriptor is False
+
+
+def test_default_stage_config_use_sp_descriptor_preserves_explicit_false():
+    """An explicit ``False`` must stay OFF (not be coerced to a truthy value)."""
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "ulysses_degree": 2,
+            "use_sp_descriptor": False,
+        }
+    )[0]
+
+    parallel_config = stage_cfg["engine_args"]["parallel_config"]
+    assert parallel_config.use_sp_descriptor is False
+
+
 def test_default_stage_config_includes_default_sampling_params():
     """Ensure default sampling params survive the default diffusion-stage builder."""
     stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
@@ -234,6 +276,56 @@ def test_serve_cli_accepts_ulysses_mode():
     assert args.ulysses_mode == "advanced_uaa"
     assert parallel_config.ulysses_degree == 4
     assert parallel_config.ulysses_mode == "advanced_uaa"
+
+
+def test_serve_cli_accepts_use_sp_descriptor():
+    """Ensure the diffusion serve CLI exposes ``--use-sp-descriptor`` and wires
+    it through to ``DiffusionParallelConfig.use_sp_descriptor`` (MUST-FIX path)."""
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "Qwen/Qwen-Image",
+            "--omni",
+            "--usp",
+            "2",
+            "--use-sp-descriptor",
+        ]
+    )
+
+    explicit_kwargs = args.get_explicit_kwargs_dict()
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]
+    parallel_config = stage_cfg["engine_args"]["parallel_config"]
+
+    assert args.use_sp_descriptor is True
+    assert parallel_config.use_sp_descriptor is True
+
+
+def test_serve_cli_use_sp_descriptor_defaults_off():
+    """Without the flag, the CLI default keeps the descriptor path OFF."""
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "Qwen/Qwen-Image",
+            "--omni",
+            "--usp",
+            "2",
+        ]
+    )
+
+    explicit_kwargs = args.get_explicit_kwargs_dict()
+    # Not explicitly passed -> not present in the explicit kwargs dict, so a
+    # deploy-YAML/stage opt-in is never clobbered by a CLI default.
+    assert "use_sp_descriptor" not in explicit_kwargs
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]
+    assert stage_cfg["engine_args"]["parallel_config"].use_sp_descriptor is False
 
 
 def test_serve_cli_accepts_diffusion_pipeline_profiler_flag():

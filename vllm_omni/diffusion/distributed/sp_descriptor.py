@@ -154,7 +154,8 @@ class SPDescriptor:
         # group splits by module -> {target: runtime input}
         for s in d.splits:
             entry = plan.setdefault(s.module, {})
-            assert isinstance(entry, dict), f"module {s.module!r} mixes split and gather"
+            if not isinstance(entry, dict):
+                raise ValueError(f"module {s.module!r} mixes split and gather declarations")
             entry[s.target] = s.to_runtime()
 
         # group gathers by module -> SequenceParallelOutput | list (position-indexed)
@@ -162,7 +163,8 @@ class SPDescriptor:
         for g in d.gathers:
             by_module.setdefault(g.module, {})[g.output_index] = g.to_runtime()
         for module, items in by_module.items():
-            assert module not in plan, f"module {module!r} mixes split and gather"
+            if module in plan:
+                raise ValueError(f"module {module!r} mixes split and gather declarations")
             if len(items) == 1 and 0 in items:
                 plan[module] = items[0]  # single-output module
             else:

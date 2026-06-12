@@ -498,8 +498,10 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
 
         if applied_count == 0:
             logger.warning(
-                f"Sequence parallelism is enabled (sp_size={sp_size}) but no transformer with _sp_plan found. "
-                "SP hooks not applied. Consider adding _sp_plan to your transformer model."
+                f"Sequence parallelism is enabled (sp_size={sp_size}) but no hook-based SP plan/descriptor "
+                "was applied to any transformer. This is expected for manual-SP models that implement "
+                "sequence parallelism inside forward() (e.g. an SPInternal-marked model like BAGEL). "
+                "Otherwise, consider adding an _sp_plan / _sp_descriptor to your transformer model."
             )
 
     except Exception as e:
