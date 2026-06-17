@@ -649,6 +649,167 @@ def apply_sequence_parallel(
             registry.register_hook(hook_name, hook)
 
 
+def _apply_sp_runtime(model, parallel_config) -> int:
+    """Apply SP wiring to a pipeline model from a resolved parallel config.
+
+    Phase 1c §5.5 A4 — extracted body of the inline registry helper that lived
+    at ``registry._apply_sequence_parallel_if_enabled`` (pre-1c
+    ``registry.py:380-488``), MINUS the global ``try/except Exception``
+    sink. The helper itself never swallows failures; the two callers each
+    wrap this call in an identical ``try/except Exception:
+    logger.warning(...)`` sink so OFF and ON paths share Phase-1b
+    warn-and-continue failure-mode parity (N1 deferred per Round-2; see
+    ``DESIGN_PHASE1C_INIT_DISPATCH.md`` §3.2 N8 / §4.5.4 row 6):
+
+    - **OFF path** — ``registry._apply_sequence_parallel_if_enabled`` (the
+      thin wrapper) wraps this call and emits ``logger.warning`` on
+      failure (preserving Phase-1b semantics).
+    - **ON path** — ``sp_ulysses.apply()`` / ``sp_ring.apply()`` each wrap
+      this call in the same ``try/except`` sink at the dispatch boundary.
+
+    The helper reads ``parallel_config.use_sp_descriptor`` exactly once per
+    call and dispatches:
+
+    - ``True``  → :func:`apply_sequence_parallel_from_descriptor`
+      (Phase-1b descriptor path).
+    - ``False`` → legacy ``_sp_plan`` resolution: :func:`get_sp_plan_from_model`
+      + :func:`apply_sequence_parallel`. F2 lock-in (§4.5.4): even on
+      models that already carry an ``_sp_descriptor`` (e.g. QwenImage), the
+      descriptor compiler is **not** reached when the flag is ``False``;
+      this preserves Phase-1b flag semantics bit-for-bit.
+
+    Idempotency / re-entry: the helper reads
+    :attr:`ForwardContext.sp_plan_hooks_applied` at the top and returns
+    ``0`` if SP hooks were already wired this stage init (either by a
+    previous helper call or by an earlier SP module's ``apply()`` in the
+    same dispatch loop). It also writes the flag at the bottom on
+    successful application, mirroring the inline registry path's single
+    ``ctx.sp_plan_hooks_applied = applied_count > 0`` write. Together these
+    preserve the "applied exactly once" invariant the inline path
+    enforced by being called once.
+
+    Args:
+        model: the pipeline (top-level ``nn.Module``, e.g. ``ZImagePipeline``)
+            whose transformer(s) SP hooks should be wired onto.
+        parallel_config: the resolved
+            :class:`vllm_omni.diffusion.data.DiffusionParallelConfig` (what
+            both callers pass through ``od_config.parallel_config``).
+
+    Returns:
+        Number of transformer modules SP hooks were applied to (0 if SP is
+        inert, if no candidate transformer carries an SP plan/descriptor,
+        or if a previous call already wired SP this stage init).
+    """
+    # Local imports keep top-level imports cycle-free and mirror the
+    # existing pattern in ``apply_sequence_parallel_from_descriptor``.
+    from vllm_omni.diffusion.distributed.sp_plan import get_sp_plan_from_model
+    from vllm_omni.diffusion.forward_context import get_forward_context
+    from vllm_omni.diffusion.utils.tf_utils import find_module_with_attr
+
+    sp_size = parallel_config.sequence_parallel_size
+    if sp_size <= 1:
+        return 0
+
+    # Re-entry guard: under the new dispatch loop both ``sp_ring`` and
+    # ``sp_ulysses`` route here in a hybrid (both-active) configuration.
+    # The first one wins; subsequent calls must not double-register hooks
+    # on the same transformer. Mirrors the single-call semantics the
+    # inline registry path enforced by being invoked exactly once.
+    fc = get_forward_context()
+    if fc.sp_plan_hooks_applied:
+        return 0
+
+    # Find transformer model(s) in the pipeline that have _sp_plan
+    # Include transformer_2 for two-stage models (e.g., Wan MoE)
+    transformer_attrs = ["transformer", "transformer_2", "dit", "unet"]
+    applied_count = 0
+
+    # Phase 1b single divergence point: the typed SPDescriptor path vs the
+    # legacy free-form `_sp_plan` path. Default (False) runs the exact legacy
+    # branch below, so output is byte-identical to the pre-1b behavior.
+    use_descriptor = getattr(parallel_config, "use_sp_descriptor", False)
+
+    for attr in transformer_attrs:
+        if not hasattr(model, attr):
+            # Some pipeline like LTX2TwoStagesPipeline have recursive
+            # modules that have the transformer
+            module = find_module_with_attr(model, attr)
+            if module is None:
+                continue
+            model = module
+
+        transformer = getattr(model, attr)
+        if transformer is None:
+            continue
+
+        if use_descriptor:
+            # Typed-descriptor path: SPInternal (Mechanism B) or a model with
+            # no descriptor registers no hooks (applied=False); an
+            # SPDescriptor expands to the same plan the legacy path uses.
+            sp_config = SequenceParallelConfig(
+                ulysses_degree=parallel_config.ulysses_degree,
+                ring_degree=parallel_config.ring_degree,
+            )
+            applied = apply_sequence_parallel_from_descriptor(transformer, sp_config)
+            if applied:
+                mode = (
+                    "hybrid"
+                    if sp_config.ulysses_degree > 1 and sp_config.ring_degree > 1
+                    else ("ulysses" if sp_config.ulysses_degree > 1 else "ring")
+                )
+                logger.info(
+                    f"Applying sequence parallelism to {transformer.__class__.__name__} ({attr}) "
+                    f"via SPDescriptor (sp_size={sp_size}, mode={mode}, "
+                    f"ulysses={sp_config.ulysses_degree}, ring={sp_config.ring_degree})"
+                )
+                applied_count += 1
+            continue
+
+        # ---- legacy path (unchanged; byte-identical when flag is OFF) ----
+        plan = get_sp_plan_from_model(transformer)
+        if plan is None:
+            continue
+
+        sp_config = SequenceParallelConfig(
+            ulysses_degree=parallel_config.ulysses_degree,
+            ring_degree=parallel_config.ring_degree,
+        )
+
+        mode = (
+            "hybrid"
+            if sp_config.ulysses_degree > 1 and sp_config.ring_degree > 1
+            else ("ulysses" if sp_config.ulysses_degree > 1 else "ring")
+        )
+        logger.info(
+            f"Applying sequence parallelism to {transformer.__class__.__name__} ({attr}) "
+            f"(sp_size={sp_size}, mode={mode}, ulysses={sp_config.ulysses_degree}, ring={sp_config.ring_degree})"
+        )
+        apply_sequence_parallel(transformer, sp_config, plan)
+        applied_count += 1
+
+    fc.sp_plan_hooks_applied = applied_count > 0
+    logger.debug(
+        f"Setting sp_plan_hooks_applied={fc.sp_plan_hooks_applied} in ``ForwardContext``!"
+    )
+
+    if applied_count == 0:
+        logger.warning(
+            f"Sequence parallelism is enabled (sp_size={sp_size}) but no hook-based SP plan/descriptor "
+            "was applied to any transformer. This is expected for manual-SP models that implement "
+            "sequence parallelism inside forward() (e.g. an SPInternal-marked model like BAGEL). "
+            "Otherwise, consider adding an _sp_plan / _sp_descriptor to your transformer model."
+        )
+
+    return applied_count
+
+
+# Phase 1c grep alias: the spec text and earlier Round-0/1 prose used the
+# name ``_apply_sp_to_model`` for the same helper. Expose it here as a
+# direct alias so any stale grep/reference resolves to the canonical
+# implementation. The alias is intentionally not part of any public API.
+_apply_sp_to_model = _apply_sp_runtime
+
+
 def apply_sequence_parallel_from_descriptor(
     model: nn.Module,
     config: SequenceParallelConfig,

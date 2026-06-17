@@ -461,6 +461,14 @@ class OrchestratorArgs:
     # DiffusionParallelConfig.use_sp_descriptor; default OFF keeps the legacy
     # `_sp_plan` path byte-identical.
     use_sp_descriptor: bool = False
+    # Phase 1c: opt into init-time dispatch — model-init wiring (VAE-PP, SP)
+    # is routed through ``Orchestrator.apply(...)`` instead of the legacy
+    # inline paths in ``registry.initialize_model``. Mirrors
+    # DiffusionParallelConfig.use_init_dispatch; default OFF keeps the legacy
+    # inline path byte-identical. The orchestrator field-name-driven
+    # redistribution machinery forwards this onto each stage's kwargs without
+    # any other edit in this file.
+    use_init_dispatch: bool = False
     diffusion_quantization_config: str | None = None
     use_hsdp: bool = False
     hsdp_shard_size: int = -1

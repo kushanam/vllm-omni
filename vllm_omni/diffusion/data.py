@@ -206,6 +206,11 @@ class DiffusionParallelConfig:
     sp_descriptor) instead of the legacy free-form ``_sp_plan`` dict / manual-SP
     path. Default False keeps the legacy path byte-identical."""
 
+    use_init_dispatch: bool = False
+    """Phase 1c: when True, model-init wiring (VAE-PP, SP) is dispatched
+    through ``Orchestrator.apply(...)``; legacy inline paths are used when
+    False (default)."""
+
     @model_validator(mode="after")
     def _validate_parallel_config(self) -> Self:
         """Validates the config relationships among the parallel strategies."""

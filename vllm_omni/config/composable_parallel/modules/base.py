@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
+    import torch
     import torch.nn as nn
     from torch.distributed import ProcessGroup
     # omni GroupCoordinator (diffusion side). Imported lazily to keep plan() torch-free.
@@ -132,9 +133,31 @@ class GroupBuildCtx:
 
 @dataclass
 class ApplyCtx:
-    """GPU context for apply() (model init). torch present."""
+    """GPU context for apply() (model init). torch present.
+
+    Phase 1c adds forward-compat fields (``execution_type``, ``device``,
+    ``rank``, ``group_handles``) used by the init-time dispatch loop in
+    ``Orchestrator.apply``; all default to ``None`` / ``{}`` so existing
+    Phase-1 / Phase-1b construction sites stay source-compatible.
+    """
     model: "nn.Module"
     od_config: object                    # OmniDiffusionConfig (carries parallel_config)
+    # StageExecutionType for this stage; lets execution-type-sensitive axis
+    # modules (e.g. ``tp`` / ``ep``) decide ownership at apply time without
+    # having to re-derive it from od_config. None preserves the pre-1c shape.
+    execution_type: object | None = None
+    # torch.device of the current rank. Forward-compat for axes that need
+    # device pinning (HSDP-into-dispatch, contract §6d). None today.
+    device: "torch.device | None" = None
+    # Current rank within the world group. Forward-compat for axes that need
+    # the current rank for warning-once / rank-0 logging. None today.
+    rank: int | None = None
+    # Per-axis GroupHandles. Empty in Phase 1c; Phase 2 fills it from
+    # ``build_groups()`` results so apply() can consume the typed handles
+    # produced by group construction. SP and VAE-PP do not consume this
+    # in Phase 1c — they read ``get_sp_group()`` directly / reuse the DiT
+    # group lazily.
+    group_handles: dict[AxisName, GroupHandle] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
