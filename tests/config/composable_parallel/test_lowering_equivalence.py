@@ -31,8 +31,7 @@ from vllm_omni.config.composable_parallel import (
     RouteByStage,
     ShardSequence,
     StitchPipeline,
-    StrategyConflictError,
-    StrategyDeviceMismatchError,
+    StrategyApplyError,
     StrategySpec,
     TakeRank,
     Union,
@@ -308,19 +307,19 @@ _FAILURE_CASES = [
             "talker": [_stage_replica(2, "round_robin")],
             "code2wav": [_stage_replica(2, "least_queue")],
         },
-        StrategyConflictError,
+        StrategyApplyError,
     ),
     (
         "device_layout_fail",
         lambda: _qwen_stages_devices("thinker", "0,1,2"),
         {"thinker": [_tp(2)]},
-        StrategyDeviceMismatchError,
+        StrategyApplyError,
     ),
     (
         "sp_device_layout_fail",
         lambda: _dit_stage_devices("0,1"),
         {"dit": [_tp(2), _sp_ulysses(2)]},
-        StrategyDeviceMismatchError,
+        StrategyApplyError,
     ),
 ]
 
