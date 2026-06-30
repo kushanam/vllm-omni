@@ -26,6 +26,10 @@ from vllm_omni.config.composable_parallel.apply import (
     _resolve_stage,
     apply_strategy_specs,
 )
+from vllm_omni.config.composable_parallel.backends import (
+    BackendAxisOwnership,
+    VLLM_BACKEND,
+)
 from vllm_omni.config.composable_parallel.modules.axes import (
     DataParallelStrategy,
     ExpertParallelStrategy,
@@ -56,48 +60,28 @@ StrategyPlan = list[StrategyModule]
 
 # The init-dispatchable subplan rebuilt at engine init by
 # ``Orchestrator.lower_from_runtime_kwargs``. A flat list of ``StrategyModule``
-# instances whose axes are members of :data:`INIT_DISPATCHABLE`. Intentionally
-# excludes ``stage_replica`` / ``tp`` / ``dp`` / ``pp`` / ``ep`` so the runtime
-# dispatcher only sees axes whose ``apply()`` actually runs at init (Phase 1c
-# §4.1.2 / §4.1.4).
+# instances that are init-dispatched for the active backend — i.e. each module
+# satisfies ``module.supports_init_dispatch and module.axis in
+# backend.delegated`` (the intersection rule, design §2.3). Intentionally
+# excludes ``stage_replica`` / ``tp`` / ``dp`` / ``pp`` / ``ep`` (native to vLLM)
+# so the runtime dispatcher only sees axes whose ``apply()`` actually runs at
+# init (Phase 1c §4.1.2 / §4.1.4).
 InitDispatchPlan = list[StrategyModule]
 
 # ---------------------------------------------------------------------------
-# Init-time dispatch contract (Phase 1c §4.1.2 / §4.4)
+# Init-time dispatch contract (Phase 1c §4.1.2 / §4.4; modularization design §2)
 # ---------------------------------------------------------------------------
-# SINGLE CANONICAL definition of the axes whose ``apply()`` Phase 1c dispatches
-# at model init. Every consumer that asks "is this axis init-dispatchable?"
-# imports THIS constant. Promotion of a future axis is a one-line edit here
-# (plus an ``apply()`` implementation on the module) — see §4.1.2 for the
-# promotion-path discussion.
-INIT_DISPATCHABLE: frozenset[AxisName] = frozenset({
-    "vae_pp",      # vae_pp.apply() lands in axes/vae_pp.py (Phase 1 pilot, §1.1)
-    "sp_ulysses",  # sp_ulysses.apply() lands in axes/sp_ulysses.py (§4.5.1)
-    "sp_ring",     # sp_ring.apply() lands in axes/sp_ring.py (§4.5.2)
-})
-
-# Canonical apply-time order of the dispatchable axes (§4.4). The dispatch loop
-# in :meth:`Orchestrator.apply` iterates this tuple, calling each module that is
-# present in the plan. ``stage_replica`` is intentionally absent — it has no
-# init-time ``apply()`` (`stage_replica.py:22-40`) and its data is not on
-# ``DiffusionParallelConfig``. Ordering rationale:
-#   * ``vae_pp`` runs first so its auto-enable of ``od_config.vae_use_tiling``
-#     is observed by the (registry-side) VAE memory-optimization step that runs
-#     after dispatch returns (§4.4.2).
-#   * ``sp_ring`` runs before ``sp_ulysses`` so the ring-only case (no Ulysses)
-#     reaches the shared SP runtime helper through ``sp_ring.apply()`` first.
-#     The Ulysses-or-hybrid case still produces a single helper application
-#     thanks to the SP-side idempotency check (§4.5.2).
-APPLY_ORDER: tuple[AxisName, ...] = ("vae_pp", "sp_ring", "sp_ulysses")
-
-# Invariant: every dispatchable axis MUST have an apply-order slot, and vice
-# versa. Enforced at module import so a future edit that grows one tuple
-# without growing the other fails loudly here (§4.4).
-assert set(APPLY_ORDER) == INIT_DISPATCHABLE, (
-    "APPLY_ORDER must enumerate exactly the axes in INIT_DISPATCHABLE: "
-    f"APPLY_ORDER={sorted(APPLY_ORDER)} vs "
-    f"INIT_DISPATCHABLE={sorted(INIT_DISPATCHABLE)}"
-)
+# There is NO global init-dispatch allowlist any more. "Is this module
+# init-dispatchable?" is answered by the intersection of two orthogonal,
+# co-located declarations:
+#   * the per-module capability ``StrategyModule.supports_init_dispatch``
+#     (base.py / each axis module), and
+#   * the per-backend ``BackendAxisOwnership.delegated`` set (backends.py).
+# Apply-time ordering likewise moved off the central ``APPLY_ORDER`` tuple onto
+# each module's ``init_dispatch_order`` key; :meth:`Orchestrator.apply` sorts
+# dispatchable modules by ``(init_dispatch_order, axis)``. For the vLLM backend
+# this reproduces today's exact set ``{vae_pp, sp_ulysses, sp_ring}`` and order
+# ``vae_pp -> sp_ring -> sp_ulysses`` (design §3).
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +162,23 @@ def _stage_execution_type(stage: Any) -> object | None:
 
 
 class Orchestrator:
+    def __init__(self, backend: BackendAxisOwnership = VLLM_BACKEND) -> None:
+        """The orchestrator is a pure function of its inputs plus the active
+        backend's axis-ownership table (design §2.2, open question 2). ``backend``
+        defaults to :data:`VLLM_BACKEND` — the only backend today — so existing
+        ``Orchestrator()`` call sites are unaffected. A non-vLLM backend passes
+        its own :class:`BackendAxisOwnership` here with no other code change.
+        """
+        self.backend = backend
+
+    def _is_init_dispatchable(self, module: StrategyModule) -> bool:
+        """The intersection rule (design §2.3): a module is init-dispatched iff
+        it declares the capability AND the active backend delegates its axis."""
+        return bool(
+            getattr(module, "supports_init_dispatch", False)
+            and module.axis in self.backend.delegated
+        )
+
     def lower_and_plan(
         self,
         stages: list[Any],
@@ -245,16 +246,21 @@ class Orchestrator:
         raise NotImplementedError("Orchestrator.build_groups lands in Phase 2+")
 
     def apply(self, plan: InitDispatchPlan, ctx: ApplyCtx) -> list[AxisResult]:
-        """Init-time dispatch loop (Phase 1c §4.2).
+        """Init-time dispatch loop (Phase 1c §4.2; modularization design §2.3).
 
-        Iterates :data:`APPLY_ORDER`; for each axis present in ``plan`` calls
-        ``module.apply(ctx)`` and collects its :class:`AxisResult`. The
-        returned list is in execution order (NOT input order).
+        Dispatches every module that is init-dispatchable for the active backend
+        (``module.supports_init_dispatch and module.axis in
+        self.backend.delegated``), calling ``module.apply(ctx)`` and collecting
+        its :class:`AxisResult`. Modules run sorted by
+        ``(init_dispatch_order, axis)``, so the returned list is in execution
+        order (NOT input order). For the vLLM backend this reproduces today's
+        ``vae_pp -> sp_ring -> sp_ulysses`` ordering exactly.
 
         Failure modes (fail-loud, no global ``try/except``):
-          * ``plan`` contains a module whose axis is not in
-            :data:`INIT_DISPATCHABLE` → :class:`UnmappedAxisError` (the
-            dispatcher honestly cannot apply it; see §4.1.5 case 1).
+          * ``plan`` contains a module that is NOT init-dispatchable for the
+            backend (capability flag off, or axis not delegated) →
+            :class:`UnmappedAxisError` (the dispatcher honestly cannot apply it;
+            see §4.1.5 case 1).
           * ``plan`` contains the same axis twice →
             :class:`OrchestratorError` (developer error; the runtime
             reconstruction path never produces duplicates).
@@ -263,18 +269,23 @@ class Orchestrator:
             parity lives inside each SP module's own wrapper per §4.5.4 row 6
             / §5.5 A4 / N1 deferred).
         """
-        # 1. Fail loud on any axis we are not equipped to dispatch.
+        # 1. Fail loud on any module we are not equipped to dispatch — i.e. one
+        # whose axis is not delegated by the active backend, or whose module
+        # does not declare the init-dispatch capability (the two-gate rule).
         for module in plan:
-            axis = module.axis
-            if axis not in INIT_DISPATCHABLE:
+            if not self._is_init_dispatchable(module):
+                axis = module.axis
                 raise UnmappedAxisError(
                     f"Orchestrator.apply received a module for axis {axis!r} "
-                    "which is NOT in INIT_DISPATCHABLE "
-                    f"({sorted(INIT_DISPATCHABLE)}). The init-time dispatcher "
-                    "can only honor axes whose apply() is implemented and "
-                    "listed in APPLY_ORDER. Promote the axis (add it to "
-                    "INIT_DISPATCHABLE and APPLY_ORDER in orchestrator.py) or "
-                    "exclude it from the InitDispatchPlan."
+                    "that is NOT init-dispatchable for backend "
+                    f"{self.backend.name!r}: it requires "
+                    "module.supports_init_dispatch is True "
+                    f"(got {getattr(module, 'supports_init_dispatch', False)!r}) "
+                    "AND the axis in the backend's delegated set "
+                    f"({sorted(self.backend.delegated)}). Promote the axis by "
+                    "setting supports_init_dispatch=True on its module (next to a "
+                    "real apply()) and adding it to the backend's delegated set, "
+                    "or exclude it from the InitDispatchPlan."
                 )
 
         # 2. Build axis -> module map; reject duplicates loudly (the runtime
@@ -289,14 +300,14 @@ class Orchestrator:
                 )
             by_axis[module.axis] = module
 
-        # 3. Iterate in canonical APPLY_ORDER, dispatching only the axes that
-        # are actually present. Skip absent axes silently — an inert axis
-        # (degree==1) is intentionally not in the plan to begin with.
+        # 3. Dispatch in ascending (init_dispatch_order, axis) order. Sorting on
+        # the per-module key (not a central tuple) is what dissolves APPLY_ORDER;
+        # the axis tiebreak keeps the order stable/deterministic on accidental
+        # ties (design §6 "order semantics" risk).
         results: list[AxisResult] = []
-        for axis in APPLY_ORDER:
-            module = by_axis.get(axis)
-            if module is None:
-                continue
+        for module in sorted(
+            by_axis.values(), key=lambda m: (m.init_dispatch_order, m.axis)
+        ):
             # Failures here propagate (see docstring); the dispatch loop is a
             # thin iterator with no global exception sink.
             results.append(module.apply(ctx))
@@ -311,15 +322,16 @@ class Orchestrator:
 
         Pure function of ``(od_config.parallel_config, execution_type)`` —
         nothing module-level crosses the config→engine boundary. The result is
-        a list of :class:`StrategyModule` instances whose axes are exactly the
-        :data:`INIT_DISPATCHABLE` axes that are currently active (``degree>1``
-        on their corresponding ``DiffusionParallelConfig`` field).
+        a list of :class:`StrategyModule` instances that are init-dispatchable
+        for the active backend (``supports_init_dispatch and axis in
+        backend.delegated``) and currently active (``degree>1`` on their
+        corresponding ``DiffusionParallelConfig`` field).
 
-        Critically: this function NEVER returns a module for an axis outside
-        :data:`INIT_DISPATCHABLE`. Even when ``od_config.parallel_config``
-        implies ``stage_replica`` / ``tp`` / ``dp`` / ``pp`` / ``ep`` axes,
-        those are intentionally absent from the returned plan — they live only
-        on the config-time :class:`StrategyPlan` (§4.1.2, §5.2 O1).
+        Critically: this function NEVER returns a module for an axis the backend
+        does not delegate. Even when ``od_config.parallel_config`` implies
+        ``stage_replica`` / ``tp`` / ``dp`` / ``pp`` / ``ep`` axes, those are
+        intentionally absent from the returned plan — they live only on the
+        config-time :class:`StrategyPlan` (§4.1.2, §5.2 O1).
 
         ``execution_type`` is accepted for API symmetry with future axes whose
         ``plan()`` is execution-type-sensitive. Today's three dispatchable
@@ -355,9 +367,10 @@ class Orchestrator:
             ) from exc
 
         # Mandatory belt-and-braces filter (§5.2 O1): if a future edit adds a
-        # candidate module for an axis outside INIT_DISPATCHABLE, drop it here
-        # rather than letting it cross the dispatch boundary.
-        return [m for m in candidates if m.axis in INIT_DISPATCHABLE]
+        # candidate module that is not init-dispatchable for the active backend
+        # (capability flag off, or axis not delegated), drop it here rather than
+        # letting it cross the dispatch boundary.
+        return [m for m in candidates if self._is_init_dispatchable(m)]
 
     # --- centralized validation (Phase 1: delegate to existing checks) ---
     def validate(self, plans: list[AxisPlan]) -> None:

@@ -6,10 +6,12 @@ CPU-only. No torch.distributed, no GPU, no real model. Synthetic
 :class:`StrategyModule` fakes record their ``apply()`` invocation order and
 construct :class:`AxisResult` carriers. The dispatch loop's contract:
 
-* Iterates :data:`APPLY_ORDER` (NOT input order).
+* Dispatches in ascending ``(init_dispatch_order, axis)`` order (NOT input
+  order) — for the vLLM backend this is ``vae_pp -> sp_ring -> sp_ulysses``.
 * Skips axes absent from the input plan (returns ``[]`` on empty input).
-* Fails LOUD with :class:`UnmappedAxisError` on any axis outside
-  :data:`INIT_DISPATCHABLE`.
+* Fails LOUD with :class:`UnmappedAxisError` on any module that is not
+  init-dispatchable for the active backend (capability flag off, or axis not
+  in the backend's ``delegated`` set).
 * Fails LOUD with :class:`OrchestratorError` on duplicate axes.
 * DOES NOT swallow exceptions raised by a module's ``apply()`` (the
   orchestrator has no global ``try/except``; SP-specific warn-and-continue
@@ -28,6 +30,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm_omni.config.composable_parallel.backends import (
+    VLLM_BACKEND,
+    effective_init_dispatch_axes,
+)
 from vllm_omni.config.composable_parallel.modules.base import (
     ApplyCtx,
     AxisName,
@@ -38,14 +44,22 @@ from vllm_omni.config.composable_parallel.modules.base import (
     OmniExecutedStrategy,
 )
 from vllm_omni.config.composable_parallel.modules.orchestrator import (
-    APPLY_ORDER,
-    INIT_DISPATCHABLE,
     OrchestratorError,
     Orchestrator,
 )
 from vllm_omni.config.composable_parallel.translator import UnmappedAxisError
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+# Canonical init-dispatch order of the vLLM-delegated axes. Mirrors the
+# ``init_dispatch_order`` keys set on the real modules (vae_pp=10, sp_ring=20,
+# sp_ulysses=30) so the fakes below reproduce production ordering without
+# importing the heavy axis modules.
+_DISPATCH_ORDER: dict[AxisName, int] = {
+    "vae_pp": 10,
+    "sp_ring": 20,
+    "sp_ulysses": 30,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -58,10 +72,17 @@ class _RecordingModule(OmniExecutedStrategy):
     ``apply()`` appends ``(self.axis, ctx)`` to the shared ``trace`` list and
     returns an :class:`AxisResult` whose ``notes`` includes the axis name so
     the test can verify the returned list's content + order.
+
+    Sets ``supports_init_dispatch=True`` (it has a real ``apply()``) and carries
+    the canonical ``init_dispatch_order`` for known axes, so the dispatch gate +
+    sort behave exactly as for the production modules.
     """
+
+    supports_init_dispatch = True
 
     def __init__(self, axis: AxisName, trace: list[tuple[AxisName, ApplyCtx]]):
         self.axis = axis
+        self.init_dispatch_order = _DISPATCH_ORDER.get(axis, 0)
         self._trace = trace
 
     def plan(self, ctx: LoweringCtx) -> AxisPlan:  # pragma: no cover - unused
@@ -80,8 +101,11 @@ class _RecordingModule(OmniExecutedStrategy):
 class _RaisingModule(OmniExecutedStrategy):
     """A fake module whose ``apply()`` raises — to verify fail-loud (§6.1.5)."""
 
+    supports_init_dispatch = True
+
     def __init__(self, axis: AxisName, exc: BaseException):
         self.axis = axis
+        self.init_dispatch_order = _DISPATCH_ORDER.get(axis, 0)
         self._exc = exc
 
     def plan(self, ctx: LoweringCtx) -> AxisPlan:  # pragma: no cover - unused
@@ -105,14 +129,31 @@ def _make_ctx() -> ApplyCtx:
 
 
 # ---------------------------------------------------------------------------
-# §6.1.1 — APPLY_ORDER / INIT_DISPATCHABLE invariant + happy paths
+# §6.1.1 — effective dispatch set + canonical order (vLLM behavior preservation)
 # ---------------------------------------------------------------------------
-def test_apply_order_matches_init_dispatchable_invariant():
-    """The import-time assertion in orchestrator.py is the source of truth;
-    re-asserting here gives the test matrix a single canonical reference."""
-    assert set(APPLY_ORDER) == INIT_DISPATCHABLE
-    # APPLY_ORDER is the canonical order: vae_pp -> sp_ring -> sp_ulysses.
-    assert APPLY_ORDER == ("vae_pp", "sp_ring", "sp_ulysses")
+def test_effective_dispatch_set_is_today_set_for_vllm():
+    """The intersection rule (capability ∩ backend.delegated) reproduces today's
+    canonical init-dispatch set for the vLLM backend — the replacement for the
+    deleted ``INIT_DISPATCHABLE`` constant."""
+    assert effective_init_dispatch_axes(VLLM_BACKEND) == frozenset(
+        {"vae_pp", "sp_ulysses", "sp_ring"}
+    )
+
+
+def test_dispatch_executes_in_canonical_order_for_all_three_axes():
+    """With all three vLLM-delegated axes present (scrambled input), the
+    dispatcher runs them in ``vae_pp -> sp_ring -> sp_ulysses`` order — the
+    behavior the old ``APPLY_ORDER`` tuple encoded, now derived from each
+    module's ``init_dispatch_order`` key."""
+    trace: list[tuple[AxisName, ApplyCtx]] = []
+    plan = [
+        _RecordingModule("sp_ulysses", trace),
+        _RecordingModule("sp_ring", trace),
+        _RecordingModule("vae_pp", trace),
+    ]
+    results = Orchestrator().apply(plan, _make_ctx())
+    assert [a for a, _ in trace] == ["vae_pp", "sp_ring", "sp_ulysses"]
+    assert [r.axis for r in results] == ["vae_pp", "sp_ring", "sp_ulysses"]
 
 
 def test_apply_empty_plan_returns_empty_list():
@@ -125,8 +166,9 @@ def test_apply_empty_plan_returns_empty_list():
 
 def test_apply_iterates_in_apply_order_not_input_order():
     """The input plan is deliberately scrambled. The dispatch loop MUST
-    reorder execution into :data:`APPLY_ORDER` and return AxisResults in
-    that execution order."""
+    reorder execution into the canonical ``(init_dispatch_order, axis)`` order
+    (``vae_pp -> sp_ring -> sp_ulysses``) and return AxisResults in that
+    execution order."""
     trace: list[tuple[AxisName, ApplyCtx]] = []
     # Input order: ulysses, vae_pp, ring. Expected exec order: vae_pp, ring, ulysses.
     plan = [
@@ -144,7 +186,8 @@ def test_apply_iterates_in_apply_order_not_input_order():
 
 def test_apply_collects_axis_results_in_execution_order():
     """The returned :class:`AxisResult` list is byte-identical to what each
-    module's ``apply()`` returned, in :data:`APPLY_ORDER`."""
+    module's ``apply()`` returned, in canonical ``(init_dispatch_order, axis)``
+    order."""
     trace: list[tuple[AxisName, ApplyCtx]] = []
     plan = [
         _RecordingModule("sp_ring", trace),
@@ -154,7 +197,7 @@ def test_apply_collects_axis_results_in_execution_order():
 
     results = Orchestrator().apply(plan, ctx)
 
-    # Two modules in plan: vae_pp runs first (per APPLY_ORDER), then sp_ring.
+    # Two modules in plan: vae_pp (order 10) runs first, then sp_ring (order 20).
     assert len(results) == 2
     assert results[0] == AxisResult(
         axis="vae_pp", hooks_applied=1, notes=("apply:vae_pp",)
@@ -165,7 +208,7 @@ def test_apply_collects_axis_results_in_execution_order():
 
 
 def test_apply_skips_axes_absent_from_plan():
-    """When only a subset of :data:`APPLY_ORDER` is in the plan, the missing
+    """When only a subset of the dispatchable axes is in the plan, the missing
     axes are silently skipped (the runtime path emits inert axes by omission;
     cf. ``Orchestrator.lower_from_runtime_kwargs`` degree-gating)."""
     trace: list[tuple[AxisName, ApplyCtx]] = []
@@ -200,11 +243,11 @@ def test_apply_passes_the_same_ctx_to_every_module():
 # §6.1.1 — fail-loud on plan-shape errors
 # ---------------------------------------------------------------------------
 def test_apply_unknown_axis_raises_unmapped_axis_error():
-    """Any axis not in :data:`INIT_DISPATCHABLE` fails LOUD with
-    :class:`UnmappedAxisError` (§4.1.5 case 1). The dispatcher cannot
+    """Any module that is not init-dispatchable for the active backend fails
+    LOUD with :class:`UnmappedAxisError` (§4.1.5 case 1). The dispatcher cannot
     honor it; silent fallback is explicitly rejected by the spec."""
     trace: list[tuple[AxisName, ApplyCtx]] = []
-    # ``tp`` is a real AxisName but not in INIT_DISPATCHABLE for Phase 1c.
+    # ``tp`` is a real AxisName but native (not delegated) on the vLLM backend.
     plan = [
         _RecordingModule("vae_pp", trace),
         _RecordingModule("tp", trace),
@@ -214,18 +257,20 @@ def test_apply_unknown_axis_raises_unmapped_axis_error():
     with pytest.raises(UnmappedAxisError) as exc_info:
         Orchestrator().apply(plan, ctx)
 
-    # Diagnostics must name the offending axis and point at APPLY_ORDER.
+    # Diagnostics must name the offending axis and cite the capability+backend
+    # gate that replaced the old INIT_DISPATCHABLE constant.
     msg = str(exc_info.value)
     assert "'tp'" in msg
-    assert "INIT_DISPATCHABLE" in msg
+    assert "supports_init_dispatch" in msg
+    assert "delegated" in msg
     # No module apply was invoked — fail-loud means stop at validation.
     assert trace == []
 
 
 def test_apply_stage_replica_axis_raises_unmapped_axis_error():
-    """``stage_replica`` is intentionally NOT in :data:`INIT_DISPATCHABLE`
-    (per §4.1.2: it has no init-time ``apply()``). A plan containing it is
-    a developer error and must fail loud — locking down the F1 / Round-2
+    """``stage_replica`` is native (not delegated) on the vLLM backend (per
+    §4.1.2: it has no init-time ``apply()``). A plan containing it is a
+    developer error and must fail loud — locking down the F1 / Round-2
     invariant that ``stage_replica`` never crosses the dispatch boundary."""
     trace: list[tuple[AxisName, ApplyCtx]] = []
     plan = [_RecordingModule("stage_replica", trace)]
@@ -274,14 +319,15 @@ def test_apply_propagates_module_apply_exception():
 
 
 def test_apply_stops_at_first_module_exception():
-    """When a module raises, subsequent modules in :data:`APPLY_ORDER` are
-    NOT invoked — the dispatcher unwinds immediately (no partial success)."""
+    """When a module raises, subsequent modules in canonical
+    ``(init_dispatch_order, axis)`` order are NOT invoked — the dispatcher
+    unwinds immediately (no partial success)."""
     trace: list[tuple[AxisName, ApplyCtx]] = []
     boom = RuntimeError("first module fails")
     plan = [
-        _RaisingModule("vae_pp", boom),       # APPLY_ORDER index 0 -> raises
-        _RecordingModule("sp_ring", trace),    # APPLY_ORDER index 1 -> must NOT run
-        _RecordingModule("sp_ulysses", trace), # APPLY_ORDER index 2 -> must NOT run
+        _RaisingModule("vae_pp", boom),       # order 10 -> runs first, raises
+        _RecordingModule("sp_ring", trace),    # order 20 -> must NOT run
+        _RecordingModule("sp_ulysses", trace), # order 30 -> must NOT run
     ]
     ctx = _make_ctx()
 

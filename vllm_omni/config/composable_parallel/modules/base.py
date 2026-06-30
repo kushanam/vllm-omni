@@ -166,6 +166,17 @@ class ApplyCtx:
 @runtime_checkable
 class StrategyModule(Protocol):
     axis: AxisName
+    # Per-module init-dispatch capability (§2.1). True iff this module performs
+    # real init-time ``apply()`` work that the orchestrator should run at model
+    # construction. Co-located with the ``apply()`` body it guards; default
+    # False (declared on the base classes) so a new axis is inert until its
+    # author explicitly opts in. Replaces the old global ``INIT_DISPATCHABLE``.
+    supports_init_dispatch: bool
+    # Ascending order key for the init-dispatch loop (§2.3). The orchestrator
+    # sorts dispatchable modules by ``(init_dispatch_order, axis)``. Only
+    # meaningful when ``supports_init_dispatch`` is True. Replaces the old
+    # global ``APPLY_ORDER`` tuple.
+    init_dispatch_order: int
     def plan(self, ctx: LoweringCtx) -> AxisPlan: ...
     def build_groups(self, ctx: GroupBuildCtx) -> AxisResult: ...
     def apply(self, ctx: ApplyCtx) -> AxisResult: ...
@@ -174,6 +185,14 @@ class StrategyModule(Protocol):
 class OmniExecutedStrategy:
     """Base for axes omni executes. Subclasses implement all three methods."""
     axis: AxisName
+    # Default: not init-applied. Modules with a real ``apply()`` body flip this
+    # True next to that ``apply()`` (e.g. vae_pp / sp_ulysses / sp_ring). Modules
+    # that inherit the NotImplementedError ``apply()`` (e.g. stage_replica) leave
+    # it False — they have no init-time work.
+    supports_init_dispatch: bool = False
+    # Ascending init-dispatch order key (§2.3); unused while
+    # ``supports_init_dispatch`` is False.
+    init_dispatch_order: int = 0
     def plan(self, ctx: LoweringCtx) -> AxisPlan: raise NotImplementedError
     def build_groups(self, ctx: GroupBuildCtx) -> AxisResult: raise NotImplementedError
     def apply(self, ctx: ApplyCtx) -> AxisResult: raise NotImplementedError
@@ -183,6 +202,10 @@ class DelegatedStrategy:
     """Base for axes vLLM executes. plan() is real; build/apply are TYPED no-ops."""
     axis: AxisName
     owned_by: OwnedBy = "vllm"
+    # The backend realizes these axes natively (engine kwargs / deploy); the
+    # composable layer never applies them at init, so this is always False.
+    supports_init_dispatch: bool = False
+    init_dispatch_order: int = 0
     def plan(self, ctx: LoweringCtx) -> AxisPlan: raise NotImplementedError
     def build_groups(self, ctx: GroupBuildCtx) -> AxisResult:
         return AxisResult.delegated(self.axis)

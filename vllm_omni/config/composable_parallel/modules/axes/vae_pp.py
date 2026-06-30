@@ -33,6 +33,13 @@ logger = init_logger(__name__)
 
 class VaePatchParallelStrategy(OmniExecutedStrategy):
     axis = "vae_pp"
+    # Real init-time apply() (see below): dispatch this module at model init.
+    supports_init_dispatch = True
+    # Runs FIRST in the init-dispatch loop (was APPLY_ORDER[0]). Rationale: its
+    # auto-enable of ``od_config.vae_use_tiling`` must be observed by the
+    # registry-side VAE memory-optimization step that runs after dispatch
+    # returns (orchestrator §4.4.2). Ordered before the SP axes (10 < 20 < 30).
+    init_dispatch_order = 10
 
     def __init__(self, degree: int):
         self._degree = int(degree)

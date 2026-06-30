@@ -6,10 +6,11 @@ CPU-only. The reconstruction is a pure function of
 ``(od_config.parallel_config, execution_type)``. The contract this file
 locks (per §4.1.2 / §4.1.4 / §5.2 O1):
 
-* Returns an :class:`InitDispatchPlan` containing ONLY axes in
-  :data:`INIT_DISPATCHABLE` — never ``stage_replica`` / ``tp`` / ``dp`` /
-  ``pp`` / ``ep``, even when the input ``parallel_config`` carries
-  positive degrees for them. This is the F1 / Round-2 correctness anchor.
+* Returns an :class:`InitDispatchPlan` containing ONLY axes that are
+  init-dispatchable for the active backend (capability ∩ ``delegated``) —
+  never ``stage_replica`` / ``tp`` / ``dp`` / ``pp`` / ``ep``, even when the
+  input ``parallel_config`` carries positive degrees for them. This is the
+  F1 / Round-2 correctness anchor.
 * Axes are active iff their degree field on ``DiffusionParallelConfig`` is
   strictly greater than 1 (``vae_patch_parallel_size``, ``ulysses_degree``,
   ``ring_degree``). Inert axes (degree==1) are absent from the plan.
@@ -28,6 +29,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm_omni.config.composable_parallel.backends import (
+    VLLM_BACKEND,
+    effective_init_dispatch_axes,
+)
 from vllm_omni.config.composable_parallel.modules.axes import (
     RingSequenceParallelStrategy,
     UlyssesSequenceParallelStrategy,
@@ -35,12 +40,22 @@ from vllm_omni.config.composable_parallel.modules.axes import (
 )
 from vllm_omni.config.composable_parallel.modules.base import LoweringCtx
 from vllm_omni.config.composable_parallel.modules.orchestrator import (
-    INIT_DISPATCHABLE,
     Orchestrator,
     RuntimePlanReconstructionError,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+# The effective init-dispatch set for the vLLM backend (replaces the deleted
+# ``INIT_DISPATCHABLE`` constant): capability ∩ backend.delegated.
+INIT_DISPATCHABLE = effective_init_dispatch_axes(VLLM_BACKEND)
+
+# Hard local regression signal independent of production metadata: pin the
+# literal expected set so a drift in the modules/backend table is caught here
+# even if the derived alias above silently changes.
+assert INIT_DISPATCHABLE == frozenset({"vae_pp", "sp_ulysses", "sp_ring"}), (
+    f"unexpected init-dispatch set for vLLM backend: {sorted(INIT_DISPATCHABLE)}"
+)
 
 
 # ---------------------------------------------------------------------------

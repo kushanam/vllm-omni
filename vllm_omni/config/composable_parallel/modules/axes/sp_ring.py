@@ -43,6 +43,13 @@ logger = init_logger(__name__)
 
 class RingSequenceParallelStrategy(OmniExecutedStrategy):
     axis = "sp_ring"
+    # Real init-time apply() (see below): dispatch this module at model init.
+    supports_init_dispatch = True
+    # Runs BEFORE sp_ulysses (was APPLY_ORDER[1]). Rationale: the ring-only case
+    # (no Ulysses) reaches the shared SP runtime helper through this module's
+    # apply() first; the Ulysses-or-hybrid case still produces a single helper
+    # application thanks to the SP-side idempotency check (orchestrator §4.5.2).
+    init_dispatch_order = 20
 
     def __init__(self, degree: int):
         self._degree = int(degree)
