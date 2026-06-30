@@ -34,6 +34,11 @@ logger = init_logger(__name__)
 
 class UlyssesSequenceParallelStrategy(OmniExecutedStrategy):
     axis = "sp_ulysses"
+    # Real init-time apply() (see below): dispatch this module at model init.
+    supports_init_dispatch = True
+    # Runs LAST of the three dispatchable axes (was APPLY_ORDER[2]); sorts after
+    # sp_ring (20) so the ring-before-ulysses ordering is preserved (10<20<30).
+    init_dispatch_order = 30
 
     def __init__(self, degree: int):
         self._degree = int(degree)

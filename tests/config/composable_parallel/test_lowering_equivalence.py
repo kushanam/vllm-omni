@@ -404,9 +404,20 @@ def test_lower_and_plan_returns_none_without_specs():
 # colocated with the T8 round-trip code below.
 from types import SimpleNamespace  # noqa: E402
 
+from vllm_omni.config.composable_parallel.backends import (  # noqa: E402
+    VLLM_BACKEND,
+    effective_init_dispatch_axes,
+)
 from vllm_omni.config.composable_parallel.modules.base import LoweringCtx  # noqa: E402
-from vllm_omni.config.composable_parallel.modules.orchestrator import (  # noqa: E402
-    INIT_DISPATCHABLE,
+
+# The effective init-dispatch set for the vLLM backend (replaces the deleted
+# ``INIT_DISPATCHABLE`` constant): capability ∩ backend.delegated.
+INIT_DISPATCHABLE = effective_init_dispatch_axes(VLLM_BACKEND)
+
+# Hard local regression signal independent of production metadata: pin the
+# literal expected set so a drift in the modules/backend table is caught here.
+assert INIT_DISPATCHABLE == frozenset({"vae_pp", "sp_ulysses", "sp_ring"}), (
+    f"unexpected init-dispatch set for vLLM backend: {sorted(INIT_DISPATCHABLE)}"
 )
 
 

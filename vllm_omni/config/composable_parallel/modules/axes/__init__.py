@@ -31,6 +31,21 @@ from vllm_omni.config.composable_parallel.modules.axes.vae_pp import (
     VaePatchParallelStrategy,
 )
 
+# Canonical per-axis StrategyModule classes (one per mesh-axis kind). The
+# single source of truth for capability introspection: the backend
+# ``effective_init_dispatch_axes`` helper and the §5.1 anti-drift consistency
+# test both enumerate THIS tuple rather than a hand-maintained allowlist.
+STRATEGY_MODULE_CLASSES = (
+    TensorParallelStrategy,
+    DataParallelStrategy,
+    PipelineParallelStrategy,
+    ExpertParallelStrategy,
+    UlyssesSequenceParallelStrategy,
+    RingSequenceParallelStrategy,
+    StageReplicaStrategy,
+    VaePatchParallelStrategy,
+)
+
 __all__ = [
     "TensorParallelStrategy",
     "DataParallelStrategy",
@@ -40,4 +55,5 @@ __all__ = [
     "RingSequenceParallelStrategy",
     "StageReplicaStrategy",
     "VaePatchParallelStrategy",
+    "STRATEGY_MODULE_CLASSES",
 ]
