@@ -25,6 +25,9 @@ from typing import Literal, NoReturn, cast, get_args
 
 from vllm.logger import init_logger
 
+from vllm_omni.config.composable_parallel.axis_defaults import (
+    SUPPORTED_KINDS as _SUPPORTED_KINDS,
+)
 from vllm_omni.config.composable_parallel.routing import (
     Broadcast,
     PartitionByHash,
@@ -52,15 +55,11 @@ L1Owner = Literal["delegated", "engine"]
 # declarative axes just drive the runtime that already exists. The remaining
 # kinds (CFG, VAE pipelines, sparse EP, ...) need per-layer hooks or custom
 # collectives and arrive in later stages.
-_SUPPORTED_KINDS: tuple[MeshAxisKind, ...] = (
-    "dp",
-    "tp",
-    "pp",
-    "ep",
-    "stage_replica",
-    "sp_ulysses",
-    "sp_ring",
-)
+#
+# The translatable allowlist is now the derived ``SUPPORTED_KINDS`` view over the
+# single ``AXIS_DEFAULTS`` table (axis_defaults.py), imported here under the
+# historical private name so the gate + error message below stay byte-identical
+# (it evaluates to the same tuple, in the same order, as the old literal).
 
 # Which EngineArgs field each axis kind *sizes*. EP and stage_replica are
 # deliberately absent: EP is not an independent world dimension but an

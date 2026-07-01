@@ -42,26 +42,14 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from vllm_omni.config.composable_parallel.aggregation import (
-    AggregationPattern,
-    FanInByStage,
-    GatherDim,
-    StitchPipeline,
-    TakeRank,
-    Union,
+from vllm_omni.config.composable_parallel.aggregation import AggregationPattern
+from vllm_omni.config.composable_parallel.axis_defaults import (
+    ROUTING_POLICY_KINDS,
+    axis_defaults,
 )
-from vllm_omni.config.composable_parallel.routing import (
-    Broadcast,
-    PipelineMicrobatch,
-    RouteByStage,
-    RoutingPattern,
-    ShardSequence,
-)
+from vllm_omni.config.composable_parallel.routing import RoutingPattern
 from vllm_omni.config.composable_parallel.spec import MeshAxisSpec, StrategySpec
 from vllm_omni.config.yaml_util import load_yaml_config, to_dict
-
-# Per-kind defaults for routing + aggregation, so the file only needs axis+size.
-_ROUTING_POLICY_KINDS = frozenset({"dp", "stage_replica"})
 
 
 class StrategyLoadError(ValueError):
@@ -69,27 +57,13 @@ class StrategyLoadError(ValueError):
 
 
 def _default_routing(kind: str, routing_policy: str | None) -> RoutingPattern:
-    if kind in _ROUTING_POLICY_KINDS:
-        return RouteByStage(routing_policy=routing_policy or "round_robin")  # type: ignore[arg-type]
-    if kind == "pp":
-        return PipelineMicrobatch()
-    if kind in ("sp_ulysses", "sp_ring"):
-        return ShardSequence(dim=1)
-    # tp, ep, and any other kind default to broadcast (the translator rejects
-    # kinds it cannot handle before it ever inspects routing).
-    return Broadcast()
+    # Per-kind routing default from the single AXIS_DEFAULTS table (axis_defaults.py).
+    return axis_defaults(kind).routing(routing_policy)
 
 
 def _default_aggregation(kind: str) -> AggregationPattern:
-    if kind == "stage_replica":
-        return FanInByStage()
-    if kind == "pp":
-        return StitchPipeline()
-    if kind in ("dp", "ep"):
-        return Union()
-    if kind in ("sp_ulysses", "sp_ring"):
-        return GatherDim(dim=1)
-    return TakeRank()
+    # Per-kind aggregation default from the single AXIS_DEFAULTS table.
+    return axis_defaults(kind).aggregation()
 
 
 def _build_spec(role: str, entry: Mapping[str, Any]) -> StrategySpec:
@@ -105,9 +79,9 @@ def _build_spec(role: str, entry: Mapping[str, Any]) -> StrategySpec:
         raise StrategyLoadError(f"role {role!r}: axis {kind!r} size must be an integer, got {entry['size']!r}") from exc
 
     routing_policy = entry.get("routing")
-    if routing_policy is not None and kind not in _ROUTING_POLICY_KINDS:
+    if routing_policy is not None and not axis_defaults(kind).accepts_routing_policy:
         raise StrategyLoadError(
-            f"role {role!r}: axis {kind!r} does not accept a 'routing' policy (only {sorted(_ROUTING_POLICY_KINDS)} do)"
+            f"role {role!r}: axis {kind!r} does not accept a 'routing' policy (only {sorted(ROUTING_POLICY_KINDS)} do)"
         )
 
     shard_extension: dict[str, Any] = {}

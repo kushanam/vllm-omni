@@ -31,6 +31,13 @@ from vllm_omni.config.composable_parallel.apply import (
     apply_strategy_specs,
     check_device_layout,
 )
+from vllm_omni.config.composable_parallel.axis_defaults import (
+    AXIS_DEFAULTS,
+    ROUTING_POLICY_KINDS,
+    SUPPORTED_KINDS,
+    AxisDefaults,
+    axis_defaults,
+)
 from vllm_omni.config.composable_parallel.modules import (
     ApplyCtx,
     AxisName,
@@ -105,6 +112,12 @@ __all__ = [
     "Combine",
     "FanInByStage",
     "AGGREGATION_PATTERN_VARIANTS",
+    # per-axis defaults table
+    "AxisDefaults",
+    "AXIS_DEFAULTS",
+    "axis_defaults",
+    "SUPPORTED_KINDS",
+    "ROUTING_POLICY_KINDS",
     # translation
     "OmniParallelConfig",
     "translate_strategy_stack",
