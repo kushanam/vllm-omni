@@ -345,6 +345,11 @@ class StageDeployConfig:
     # DiffusionParallelConfig.use_sp_descriptor; the diffusion runtime-override
     # mover copies it onto the nested parallel_config (it is a parallel field).
     use_sp_descriptor: bool | None = None
+    # Phase 1c: opt a stage into init-time dispatch via ``Orchestrator.apply``.
+    # Mirrors DiffusionParallelConfig.use_init_dispatch; the existing
+    # ``_build_engine_args`` mover copies non-None override fields onto the
+    # stage's ``yaml_engine_args`` automatically (see stage_config.py:861-866).
+    use_init_dispatch: bool | None = None
 
     # Compilation, profiling, tokenizer/config parsing, and model loading.
     compilation_config: dict[str, Any] | None = None

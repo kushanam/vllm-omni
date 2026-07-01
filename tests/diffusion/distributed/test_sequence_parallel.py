@@ -88,6 +88,7 @@ def _run_inference(
     seed: int = DEFAULT_SEED,
     warmup: bool = True,
     use_sp_descriptor: bool = False,
+    use_init_dispatch: bool = False,
 ) -> InferenceResult:
     """Run inference with specified configuration.
 
@@ -97,11 +98,19 @@ def _run_inference(
             typed ``SPDescriptor`` declaration instead of the legacy ``_sp_plan``
             dict. Threaded onto the constructed ``DiffusionParallelConfig`` so the
             equivalence gate below can genuinely toggle the new path.
+        use_init_dispatch: Phase 1c-Twin flag. When True, model-init wiring
+            (VAE-PP, SP) is dispatched through ``Orchestrator.apply(...)`` and
+            SP wiring runs through the *new*-path
+            ``apply_sp_to_pipeline`` helper. When False (default), the legacy
+            inline ``_apply_sp_runtime`` body is used. Threaded onto
+            ``DiffusionParallelConfig`` so the GPU equivalence gate below can
+            parameterize over both paths.
     """
     parallel_config = DiffusionParallelConfig(
         ulysses_degree=ulysses_degree,
         ring_degree=ring_degree,
         use_sp_descriptor=use_sp_descriptor,
+        use_init_dispatch=use_init_dispatch,
     )
     try:
         with OmniRunner(
@@ -316,8 +325,13 @@ def _image_sha256(img: Image.Image) -> str:
 @pytest.mark.diffusion
 @pytest.mark.parallel
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 2, "rocm": 2})
+@pytest.mark.parametrize(
+    "use_init_dispatch",
+    [False, True],
+    ids=["dispatch_off_legacy_path", "dispatch_on_new_path"],
+)
 @pytest.mark.parametrize("model_name", MODELS)
-def test_sp_descriptor_equivalence_gate(model_name: str):
+def test_sp_descriptor_equivalence_gate(model_name: str, use_init_dispatch: bool):
     """Prove the SPDescriptor path (flag ON) == the legacy ``_sp_plan`` path (OFF).
 
     Runs the SAME QwenImage generation twice under identical SP degrees — once
@@ -352,6 +366,7 @@ def test_sp_descriptor_equivalence_gate(model_name: str):
         ring_degree=ring_degree,
         warmup=True,
         use_sp_descriptor=False,
+        use_init_dispatch=use_init_dispatch,
     )
     descriptor = _run_inference(
         model_name,
@@ -361,6 +376,7 @@ def test_sp_descriptor_equivalence_gate(model_name: str):
         ring_degree=ring_degree,
         warmup=True,
         use_sp_descriptor=True,
+        use_init_dispatch=use_init_dispatch,
     )
     assert len(legacy.images) == 1 and len(descriptor.images) == 1
 
@@ -589,3 +605,399 @@ def test_wan_sp_plan() -> None:
     assert shard_plan[0].split_output is True
 
     validate_sp_plan(plan)
+
+
+# =============================================================================
+# Phase 1c (T6 §6.1.5): CPU-level SP dispatch routing tests.
+#
+# These tests exercise Phase 1c §4.5 — the migration of the inline
+# ``_apply_sequence_parallel_if_enabled`` body off the registry and into the
+# shared ``_apply_sp_runtime`` helper, plus the ON path through
+# ``sp_ulysses.apply`` / ``sp_ring.apply``. They lock in the four properties
+# the spec §6.1.5 / §4.5.4 calls out:
+#
+#   (a) OFF path → registry's thin wrapper ``_apply_sequence_parallel_if_enabled``
+#       delegates to ``_apply_sp_runtime`` (legacy helper, unchanged).
+#   (b) ON  path → ``sp_ulysses.apply`` / ``sp_ring.apply`` delegate to the
+#       NEW ``apply_sp_to_pipeline`` helper in ``sp_runtime.py`` (Twin path,
+#       fully independent from the legacy helper per
+#       ``docs/DESIGN_PHASE1C_TWIN_PATHS.md``).
+#   (c) F2 lock-in (§4.5.4 (use_init_dispatch=True, use_sp_descriptor=False)
+#       cell): even on a model that already carries an ``_sp_descriptor``, the
+#       legacy ``_sp_plan`` branch is taken — ``apply_sequence_parallel_from_descriptor``
+#       is NOT reached.
+#   (d) OFF and ON paths return identical ``hooks_applied`` counts via
+#       INDEPENDENT helpers (legacy ``_apply_sp_runtime`` vs new
+#       ``apply_sp_to_pipeline``); equivalence is asserted by tests, not by
+#       construction.
+#
+# CPU-only by construction: every distributed dependency is mocked.
+# =============================================================================
+
+from unittest.mock import MagicMock, patch  # noqa: E402
+
+import torch.nn as nn  # noqa: E402
+
+from vllm_omni.config.composable_parallel.modules.axes.sp_ring import (  # noqa: E402
+    RingSequenceParallelStrategy,
+)
+from vllm_omni.config.composable_parallel.modules.axes.sp_ulysses import (  # noqa: E402
+    UlyssesSequenceParallelStrategy,
+)
+from vllm_omni.config.composable_parallel.modules.base import ApplyCtx  # noqa: E402
+from vllm_omni.diffusion.data import OmniDiffusionConfig  # noqa: E402
+from vllm_omni.diffusion.forward_context import (  # noqa: E402
+    ForwardContext,
+    override_forward_context,
+)
+from vllm_omni.diffusion.hooks.sequence_parallel import _apply_sp_runtime  # noqa: E402
+from vllm_omni.diffusion.registry import _apply_sequence_parallel_if_enabled  # noqa: E402
+
+
+def _make_od_config(
+    *,
+    ulysses_degree: int = 2,
+    ring_degree: int = 1,
+    use_sp_descriptor: bool = False,
+    use_init_dispatch: bool = False,
+) -> OmniDiffusionConfig:
+    """Build a minimal CPU-side OmniDiffusionConfig for dispatch routing tests.
+
+    Only the SP-relevant fields on ``parallel_config`` are populated; everything
+    else takes its dataclass default.
+    """
+    od = OmniDiffusionConfig()
+    od.parallel_config = DiffusionParallelConfig(
+        ulysses_degree=ulysses_degree,
+        ring_degree=ring_degree,
+        use_sp_descriptor=use_sp_descriptor,
+        use_init_dispatch=use_init_dispatch,
+    )
+    return od
+
+
+class _FakeTransformer(nn.Module):
+    """Minimal nn.Module standing in for a pipeline's ``.transformer``.
+
+    The optional ``_sp_descriptor`` attribute is what the F2 lock-in test uses:
+    even though this fake carries one, ``_apply_sp_runtime`` MUST take the
+    legacy ``_sp_plan`` branch when ``use_sp_descriptor=False``. The ``_sp_plan``
+    attribute itself doesn't need a real value here — ``get_sp_plan_from_model``
+    is mocked at the helper boundary in the F2 test.
+    """
+
+    def __init__(self, *, with_descriptor: bool = False) -> None:
+        super().__init__()
+        if with_descriptor:
+            self._sp_descriptor = object()  # opaque sentinel; never inspected
+
+
+class _FakePipeline(nn.Module):
+    """Minimal pipeline shell with a ``.transformer`` attribute the SP helper
+    discovers via the canonical scan order ``["transformer", ...]``.
+    """
+
+    def __init__(self, transformer: _FakeTransformer) -> None:
+        super().__init__()
+        self.transformer = transformer
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_off_path_calls_apply_sp_runtime_via_registry_wrapper():
+    """(a) OFF path: ``_apply_sequence_parallel_if_enabled`` delegates to
+    ``_apply_sp_runtime`` exactly once and returns its result.
+
+    This is the §5.4 R1(c) shape: the wrapper is now a one-line delegator
+    that wraps the helper in the Phase-1b ``try/except Exception:
+    logger.warning(...)`` sink.
+    """
+    model = _FakePipeline(_FakeTransformer())
+    od = _make_od_config(use_init_dispatch=False)
+
+    with patch(
+        "vllm_omni.diffusion.registry._apply_sp_runtime",
+        return_value=3,
+    ) as helper:
+        result = _apply_sequence_parallel_if_enabled(model, od)
+
+    assert helper.call_count == 1, "OFF path must call helper exactly once"
+    args, _ = helper.call_args
+    assert args[0] is model
+    assert args[1] is od.parallel_config, (
+        "OFF path must pass od_config.parallel_config to the helper "
+        "(matching the ON-path call signature in sp_ulysses.apply)"
+    )
+    assert result == 3, "wrapper must propagate the helper's return value"
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_off_path_warn_and_continue_on_helper_failure():
+    """N1 deferred (§3.2 N8 / §4.5.4 row 6): the OFF wrapper preserves the
+    Phase-1b ``try/except Exception: logger.warning(...)`` sink. A failing
+    helper produces ``hooks_applied == 0`` and a warning, never a raise.
+    """
+    model = _FakePipeline(_FakeTransformer())
+    od = _make_od_config(use_init_dispatch=False)
+
+    with patch(
+        "vllm_omni.diffusion.registry._apply_sp_runtime",
+        side_effect=RuntimeError("synthetic SP wiring failure"),
+    ):
+        result = _apply_sequence_parallel_if_enabled(model, od)
+
+    assert result == 0, "OFF path must warn-and-continue on helper failure"
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_on_path_sp_ulysses_calls_apply_sp_to_pipeline():
+    """ON path: ``sp_ulysses.apply(ctx)`` delegates to ``apply_sp_to_pipeline``
+    (the new Twin SP runtime) via the same try/except sink as the OFF wrapper.
+    The OFF path still uses ``_apply_sp_runtime`` (legacy); see
+    ``test_off_path_calls_apply_sp_runtime_via_registry_wrapper``.
+    """
+    model = _FakePipeline(_FakeTransformer())
+    od = _make_od_config(use_init_dispatch=True, ulysses_degree=2)
+    fc = ForwardContext(omni_diffusion_config=od)
+
+    ctx = ApplyCtx(model=model, od_config=od)
+    with (
+        override_forward_context(fc),
+        patch(
+            "vllm_omni.diffusion.distributed.sp_runtime.apply_sp_to_pipeline",
+            return_value=5,
+        ) as helper,
+    ):
+        result = UlyssesSequenceParallelStrategy(2).apply(ctx)
+
+    # The apply() body lazily imports ``apply_sp_to_pipeline`` from
+    # ``sp_runtime``; patching the source module suffices since each call
+    # resolves through the module dict.
+    assert helper.call_count == 1, (
+        "sp_ulysses.apply must call apply_sp_to_pipeline exactly once"
+    )
+    args, _ = helper.call_args
+    assert args[0] is model
+    assert args[1] is od.parallel_config
+    assert result.axis == "sp_ulysses"
+    assert result.hooks_applied == 5
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_on_path_sp_ring_calls_apply_sp_to_pipeline_when_not_yet_applied():
+    """ON path: ``sp_ring.apply(ctx)`` delegates to ``apply_sp_to_pipeline``
+    when SP has not yet been wired for this stage init.
+    """
+    model = _FakePipeline(_FakeTransformer())
+    od = _make_od_config(use_init_dispatch=True, ulysses_degree=1, ring_degree=2)
+    fc = ForwardContext(omni_diffusion_config=od)
+    fc.sp_plan_hooks_applied = False
+
+    ctx = ApplyCtx(model=model, od_config=od)
+    with (
+        override_forward_context(fc),
+        patch(
+            "vllm_omni.diffusion.distributed.sp_runtime.apply_sp_to_pipeline",
+            return_value=2,
+        ) as helper,
+    ):
+        result = RingSequenceParallelStrategy(2).apply(ctx)
+
+    assert helper.call_count == 1
+    args, _ = helper.call_args
+    assert args[0] is model
+    assert args[1] is od.parallel_config
+    assert result.axis == "sp_ring"
+    assert result.hooks_applied == 2
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_on_path_sp_ring_short_circuits_when_already_applied():
+    """``sp_ring`` is the idempotent companion (§4.5.2): if SP hooks were
+    already wired this stage init (e.g. by ``sp_ulysses`` in a hybrid config
+    or by a re-entry of the dispatch loop), ``apply()`` returns
+    ``hooks_applied=0`` and does NOT invoke ``apply_sp_to_pipeline``.
+    """
+    model = _FakePipeline(_FakeTransformer())
+    od = _make_od_config(use_init_dispatch=True, ulysses_degree=1, ring_degree=2)
+    fc = ForwardContext(omni_diffusion_config=od)
+    fc.sp_plan_hooks_applied = True  # belt-and-braces idempotency marker
+
+    ctx = ApplyCtx(model=model, od_config=od)
+    with (
+        override_forward_context(fc),
+        patch(
+            "vllm_omni.diffusion.distributed.sp_runtime.apply_sp_to_pipeline",
+            return_value=99,
+        ) as helper,
+    ):
+        result = RingSequenceParallelStrategy(2).apply(ctx)
+
+    assert helper.call_count == 0, (
+        "sp_ring must NOT call apply_sp_to_pipeline after SP applied"
+    )
+    assert result.axis == "sp_ring"
+    assert result.hooks_applied == 0
+    assert any("idempotent" in n.lower() for n in result.notes)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_on_path_sp_ulysses_warn_and_continue_on_helper_failure():
+    """N1 deferred: ``sp_ulysses.apply`` mirrors the OFF wrapper's
+    ``try/except Exception: logger.warning(...)`` sink so OFF and ON paths
+    have bit-identical warn-and-continue behavior on SP wiring failures —
+    even though the ON path now goes through ``apply_sp_to_pipeline`` rather
+    than ``_apply_sp_runtime``.
+    """
+    model = _FakePipeline(_FakeTransformer())
+    od = _make_od_config(use_init_dispatch=True, ulysses_degree=2)
+    fc = ForwardContext(omni_diffusion_config=od)
+
+    ctx = ApplyCtx(model=model, od_config=od)
+    with (
+        override_forward_context(fc),
+        patch(
+            "vllm_omni.diffusion.distributed.sp_runtime.apply_sp_to_pipeline",
+            side_effect=RuntimeError("synthetic SP wiring failure"),
+        ),
+    ):
+        result = UlyssesSequenceParallelStrategy(2).apply(ctx)
+
+    assert result.axis == "sp_ulysses"
+    assert result.hooks_applied == 0, "ON path must warn-and-continue, not raise"
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_off_and_on_paths_return_identical_hooks_applied_count():
+    """(d) OFF and ON paths produce IDENTICAL ``hooks_applied`` counts through
+    INDEPENDENT helpers — OFF via legacy ``_apply_sp_runtime``, ON via new
+    ``apply_sp_to_pipeline``. Locks the Twin-path observable-equivalence
+    contract (``docs/DESIGN_PHASE1C_TWIN_PATHS.md`` §7.1); replaces the
+    pre-Twin assertion that both callers shared one helper.
+    """
+    helper_return = 7
+
+    # OFF path: registry wrapper → legacy helper.
+    model_off = _FakePipeline(_FakeTransformer())
+    od_off = _make_od_config(use_init_dispatch=False, ulysses_degree=2)
+    with patch(
+        "vllm_omni.diffusion.registry._apply_sp_runtime",
+        return_value=helper_return,
+    ):
+        off_count = _apply_sequence_parallel_if_enabled(model_off, od_off)
+
+    # ON path: sp_ulysses.apply → new Twin helper.
+    model_on = _FakePipeline(_FakeTransformer())
+    od_on = _make_od_config(use_init_dispatch=True, ulysses_degree=2)
+    fc = ForwardContext(omni_diffusion_config=od_on)
+    ctx = ApplyCtx(model=model_on, od_config=od_on)
+    with (
+        override_forward_context(fc),
+        patch(
+            "vllm_omni.diffusion.distributed.sp_runtime.apply_sp_to_pipeline",
+            return_value=helper_return,
+        ),
+    ):
+        on_result = UlyssesSequenceParallelStrategy(2).apply(ctx)
+
+    assert off_count == on_result.hooks_applied == helper_return, (
+        f"OFF={off_count} ON={on_result.hooks_applied} expected={helper_return}; "
+        "OFF (via _apply_sp_runtime) and ON (via apply_sp_to_pipeline) must "
+        "produce identical hook counts (Twin observable-equivalence)."
+    )
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_f2_lock_in_legacy_path_taken_even_on_descriptor_bearing_model():
+    """(c) F2 lock-in (§4.5.4 cell ``(use_init_dispatch=True, use_sp_descriptor=False)``):
+    even when the model carries an ``_sp_descriptor`` (e.g. a Phase-1b
+    migrated model like QwenImage), the legacy ``_sp_plan`` branch is taken
+    when ``use_sp_descriptor=False``. ``apply_sequence_parallel_from_descriptor``
+    must NOT be reached.
+
+    This is the central correctness lock the Round-1 review surfaced: the
+    earlier draft incorrectly routed this cell through the descriptor
+    compiler, which would silently flip OFF-path semantics on already-migrated
+    models. We verify by exercising the real ``_apply_sp_runtime`` (no helper
+    mock) and patching the two terminal branches inside the helper.
+    """
+    transformer = _FakeTransformer(with_descriptor=True)
+    model = _FakePipeline(transformer)
+    od = _make_od_config(
+        use_init_dispatch=True,
+        ulysses_degree=2,
+        use_sp_descriptor=False,
+    )
+    fc = ForwardContext(omni_diffusion_config=od)
+
+    fake_plan = MagicMock(name="fake_sp_plan")  # truthy → legacy branch applies
+    with (
+        override_forward_context(fc),
+        patch(
+            "vllm_omni.diffusion.hooks.sequence_parallel.apply_sequence_parallel_from_descriptor",
+        ) as descriptor_apply,
+        patch(
+            "vllm_omni.diffusion.hooks.sequence_parallel.apply_sequence_parallel",
+        ) as legacy_apply,
+        patch(
+            "vllm_omni.diffusion.distributed.sp_plan.get_sp_plan_from_model",
+            return_value=fake_plan,
+        ) as get_plan,
+    ):
+        applied = _apply_sp_runtime(model, od.parallel_config)
+
+    assert descriptor_apply.call_count == 0, (
+        "F2 lock-in: apply_sequence_parallel_from_descriptor MUST NOT be called "
+        "when use_sp_descriptor=False, even on _sp_descriptor-bearing models."
+    )
+    assert get_plan.call_count >= 1, (
+        "F2 lock-in: legacy branch must consult get_sp_plan_from_model."
+    )
+    assert legacy_apply.call_count == 1, (
+        "F2 lock-in: legacy apply_sequence_parallel must be called exactly once."
+    )
+    assert applied == 1, "one transformer wired in the legacy branch"
+    # Verify the helper wrote the marker on success (mirrors registry.py:472-473).
+    assert fc.sp_plan_hooks_applied is True
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_f2_descriptor_branch_taken_when_flag_on():
+    """Sibling of ``test_f2_lock_in_legacy_path_taken_...``: when
+    ``use_sp_descriptor=True``, the descriptor branch IS taken (the §4.5.4
+    cell ``(use_init_dispatch=True, use_sp_descriptor=True)``). Locks the
+    matrix's positive cell so a future regression that breaks the flag
+    would fail loudly.
+    """
+    transformer = _FakeTransformer(with_descriptor=True)
+    model = _FakePipeline(transformer)
+    od = _make_od_config(
+        use_init_dispatch=True,
+        ulysses_degree=2,
+        use_sp_descriptor=True,
+    )
+    fc = ForwardContext(omni_diffusion_config=od)
+
+    with (
+        override_forward_context(fc),
+        patch(
+            "vllm_omni.diffusion.hooks.sequence_parallel.apply_sequence_parallel_from_descriptor",
+            return_value=True,
+        ) as descriptor_apply,
+        patch(
+            "vllm_omni.diffusion.hooks.sequence_parallel.apply_sequence_parallel",
+        ) as legacy_apply,
+    ):
+        applied = _apply_sp_runtime(model, od.parallel_config)
+
+    assert descriptor_apply.call_count == 1
+    assert legacy_apply.call_count == 0
+    assert applied == 1

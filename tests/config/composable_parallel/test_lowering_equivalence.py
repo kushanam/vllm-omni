@@ -370,3 +370,119 @@ def test_lower_and_plan_returns_none_without_specs():
     assert Orchestrator().lower_and_plan(stages, {}) is None
     # stages untouched.
     assert "tensor_parallel_size" not in stages[0].yaml_engine_args
+
+
+# ---------------------------------------------------------------------------
+# T8 (Phase 1c, §5.6 / §6.1.3 / §4.1.4) — init-dispatch subplan round-trip.
+#
+# For a representative strategy stack, the FILTERED config-time subplan
+# ``[m for m in modules_by_role[role] if m.axis in INIT_DISPATCHABLE]``
+# (with degree-active gating to mirror the runtime path) deep-equals the
+# engine-time ``Orchestrator.lower_from_runtime_kwargs(od_config, exec_type)``
+# output for the matching role.
+#
+# This is the lock that makes config-time and engine-time planners equivalent
+# **for the axes Phase 1c actually dispatches** (§4.1.4). The comparison is
+# against the **filtered InitDispatchPlan**, NOT against the full
+# ``StrategyPlan`` (which still contains ``stage_replica`` / ``tp`` / ``ep``
+# at config time and intentionally never crosses to the worker).
+#
+# Test cases are restricted to specs whose dispatchable axes have ``degree>1``
+# — degree-1 init-dispatchable modules are emitted by the config-time module
+# view but elided by the runtime path (which gates on ``degree>1``). The
+# degree-active filter on the config side aligns the two paths so the
+# deep-equal claim holds without additional normalization. The existing
+# ``sp_*_degree1`` cases in the matrix above already exercise the
+# config-time gating; T8 focuses on the round-trip.
+# ---------------------------------------------------------------------------
+
+# T8 round-trip imports — kept local to this section so the file's top-level
+# import block stays append-only relative to its pre-T8 shape (T2 NIT
+# follow-up). ``Orchestrator`` is already imported at the top because other
+# tests in the matrix also use it; only the T8-specific symbols
+# (``SimpleNamespace`` / ``LoweringCtx`` / ``INIT_DISPATCHABLE``) are
+# colocated with the T8 round-trip code below.
+from types import SimpleNamespace  # noqa: E402
+
+from vllm_omni.config.composable_parallel.modules.base import LoweringCtx  # noqa: E402
+from vllm_omni.config.composable_parallel.modules.orchestrator import (  # noqa: E402
+    INIT_DISPATCHABLE,
+)
+
+
+_T8_CASES = [
+    ("sp_ulysses", _dit_stage, {"dit": [_sp_ulysses(2)]}),
+    ("sp_ring", _dit_stage, {"dit": [_sp_ring(2)]}),
+    ("sp_ulysses+sp_ring", _dit_stage, {"dit": [_sp_ulysses(2), _sp_ring(2)]}),
+    # Degree-1 / no-op case: both paths produce an empty subplan (a non-trivial
+    # equivalence claim — the config-time side filters by INIT_DISPATCHABLE and
+    # degree, the engine-time side filters by degree at construction).
+    ("no_dispatchable_axes", _dit_stage, {"dit": [_tp(2)]}),
+]
+
+
+def _filtered_config_time_subplan(modules: list):
+    """The filtered InitDispatchPlan from a config-time module list (§4.1.4).
+
+    Includes modules whose axis is in :data:`INIT_DISPATCHABLE` AND whose
+    plan() reports an active (``degree>1``) axis — matching the engine-time
+    path's gating so the round-trip deep-equal holds.
+    """
+    out = []
+    for m in modules:
+        if m.axis not in INIT_DISPATCHABLE:
+            continue
+        if m.plan(LoweringCtx()).degree <= 1:
+            continue
+        out.append(m)
+    return out
+
+
+def _od_config_from(per_role_cfg) -> SimpleNamespace:
+    """Build a minimal od_config stand-in carrying the three runtime degrees.
+
+    Mirrors what ``OmniDiffusionConfig.parallel_config`` would expose for the
+    dispatchable axes; non-dispatchable fields are set to sentinel-active
+    values (``tensor_parallel_size`` etc.) to lock down the F1 / §5.2 O1
+    invariant that the runtime path ignores them.
+    """
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            # vae_pp cannot be expressed via strategy specs today (it is a
+            # reserved kind the translator rejects), so the round-trip starts
+            # from vae_patch_parallel_size=1 in T8.
+            vae_patch_parallel_size=1,
+            ulysses_degree=per_role_cfg.sp_ulysses_size,
+            ring_degree=per_role_cfg.sp_ring_size,
+            tensor_parallel_size=per_role_cfg.tensor_parallel_size,
+            data_parallel_size=per_role_cfg.data_parallel_size,
+            pipeline_parallel_size=per_role_cfg.pipeline_parallel_size,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "case_id, make_stages, specs", _T8_CASES, ids=[c[0] for c in _T8_CASES]
+)
+def test_init_dispatch_subplan_round_trip(case_id, make_stages, specs):
+    stages = make_stages()
+    result = Orchestrator().lower_and_plan(stages, specs)
+    assert result is not None
+
+    for role, modules in result.modules_by_role.items():
+        expected = _filtered_config_time_subplan(modules)
+        per_role_cfg = result.apply_result.per_role_config[role]
+        od_config = _od_config_from(per_role_cfg)
+
+        actual = Orchestrator().lower_from_runtime_kwargs(
+            od_config, execution_type=None
+        )
+
+        # Deep-equal on AxisPlan: covers axes, degrees, owned_by,
+        # engine_kwargs, rank_token, consumes_world_dim (§4.1.4).
+        expected_plans = [m.plan(LoweringCtx()) for m in expected]
+        actual_plans = [m.plan(LoweringCtx()) for m in actual]
+        assert expected_plans == actual_plans, (
+            f"role={role!r} subplan mismatch: "
+            f"expected={expected_plans} actual={actual_plans}"
+        )

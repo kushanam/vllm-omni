@@ -483,6 +483,16 @@ class OmniServeCommand(CLISubcommand):
             "Default OFF keeps the legacy path byte-identical.",
         )
         omni_config_group.add_argument(
+            "--use-init-dispatch",
+            dest="use_init_dispatch",
+            action="store_true",
+            help="Phase 1c: opt into init-time dispatch — model-init wiring "
+            "(VAE-PP, SP) is routed through `Orchestrator.apply(...)` instead "
+            "of the legacy inline paths in `registry.initialize_model`. "
+            "Equivalent to setting DiffusionParallelConfig.use_init_dispatch. "
+            "Default OFF keeps the legacy path byte-identical.",
+        )
+        omni_config_group.add_argument(
             "--diffusion-quantization-config",
             type=json.loads,
             default=None,

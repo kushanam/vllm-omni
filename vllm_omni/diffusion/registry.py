@@ -10,10 +10,7 @@ from vllm.model_executor.models.registry import _LazyRegisteredModel, _ModelRegi
 
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig, get_sp_plan_from_model
-from vllm_omni.diffusion.forward_context import get_forward_context
-from vllm_omni.diffusion.hooks.sequence_parallel import apply_sequence_parallel
-from vllm_omni.diffusion.utils.tf_utils import find_module_with_attr
+from vllm_omni.diffusion.hooks.sequence_parallel import _apply_sp_runtime
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -367,145 +364,115 @@ def initialize_model(
         with set_current_diffusion_config(od_config):
             model = model_class(od_config=od_config)
 
-        # VAE patch parallelism, now routed through the module. apply() owns the
-        # full vae_pp block (warning + vae_use_tiling auto-enable + set_parallel_size)
-        # and runs BEFORE the use_slicing/use_tiling memory-optimization lines so
-        # the auto-enabled vae_use_tiling value is what gets written (§4.2).
+        # Phase 1c §5.4 R1: VAE-PP and SP wiring are flag-gated. ``ApplyCtx``
+        # is imported once here because both branches construct one. The
+        # ordering invariants the spec mandates:
+        #   * vae_pp.apply() runs BEFORE the ``model.vae.use_tiling = ...``
+        #     write so the auto-enabled ``od_config.vae_use_tiling`` value is
+        #     propagated onto the model (§4.2 / §4.4.2).
+        #   * On the OFF path the today-verbatim order is preserved
+        #     (vae_pp -> memory-opt -> legacy SP), keeping the legacy path
+        #     byte-identical to pre-1c (G5 / §5.4 R1(a)).
+        #   * On the ON path the dispatch loop owns vae_pp + SP (in
+        #     APPLY_ORDER); memory-opt runs immediately AFTER the dispatch
+        #     returns (post-dispatch normalization, §4.4.2 / §5.4 R1(b)).
         # Imported locally to avoid an import-time cycle.
-        from vllm_omni.config.composable_parallel.modules.axes.vae_pp import (
-            VaePatchParallelStrategy,
-        )
         from vllm_omni.config.composable_parallel.modules.base import ApplyCtx
 
-        VaePatchParallelStrategy(
-            od_config.parallel_config.vae_patch_parallel_size
-        ).apply(ApplyCtx(model=model, od_config=od_config))
+        if od_config.parallel_config.use_init_dispatch:
+            # New path (§4.2 / §5.4 R1(a)): Orchestrator.apply dispatches the
+            # init-dispatchable axes (vae_pp first, then sp_ring/sp_ulysses
+            # per APPLY_ORDER). VAE-PP and SP are reached ONLY through this
+            # call when the flag is True; the bespoke inline calls below
+            # (else-branch) are intentionally NOT executed here so VAE-PP is
+            # applied exactly once.
+            from vllm_omni.config.composable_parallel.modules.orchestrator import (
+                Orchestrator,
+            )
+            from vllm_omni.config.stage_config import StageExecutionType
 
-        # Configure VAE memory optimization settings from config (not VAE-PP)
-        if hasattr(model, "vae") and hasattr(model.vae, "use_slicing"):
-            model.vae.use_slicing = od_config.vae_use_slicing
-        if hasattr(model, "vae") and hasattr(model.vae, "use_tiling"):
-            model.vae.use_tiling = od_config.vae_use_tiling
+            # §10 Assumption 1: ``initialize_model`` is, by construction, only
+            # called for diffusion-side model loading. The AR path uses vLLM's
+            # own model registry; the broader caller census (loader / ROCm
+            # patch / examples) all flow through the diffusion init path.
+            exec_type = StageExecutionType.DIFFUSION
+            ctx = ApplyCtx(
+                model=model,
+                od_config=od_config,
+                execution_type=exec_type,
+            )
+            plan = Orchestrator().lower_from_runtime_kwargs(od_config, exec_type)
+            Orchestrator().apply(plan, ctx)
 
-        # Apply sequence parallelism if enabled
-        # This follows diffusers' pattern where enable_parallelism() is called
-        # at model loading time, not inside individual model files
-        _apply_sequence_parallel_if_enabled(model, od_config)
+            # Memory-opt: post-dispatch normalization (§4.4.2). Runs AFTER
+            # vae_pp.apply() returns so the auto-enabled
+            # ``od_config.vae_use_tiling`` value is propagated onto
+            # ``model.vae.use_tiling``. SP only mutates transformer hooks and
+            # does not interact with these VAE knobs.
+            if hasattr(model, "vae") and hasattr(model.vae, "use_slicing"):
+                model.vae.use_slicing = od_config.vae_use_slicing
+            if hasattr(model, "vae") and hasattr(model.vae, "use_tiling"):
+                model.vae.use_tiling = od_config.vae_use_tiling
+        else:
+            # Legacy inline path (§5.4 R1(a) "else run the existing inline
+            # paths verbatim"): vae_pp -> memory-opt -> legacy SP wrapper.
+            # The thin ``_apply_sequence_parallel_if_enabled`` wrapper
+            # preserves Phase-1b warn-and-continue failure-mode parity (N1
+            # deferred — see §3.2 N8 / §4.5.4 row 6).
+            from vllm_omni.config.composable_parallel.modules.axes.vae_pp import (
+                VaePatchParallelStrategy,
+            )
+
+            VaePatchParallelStrategy(
+                od_config.parallel_config.vae_patch_parallel_size
+            ).apply(ApplyCtx(model=model, od_config=od_config))
+
+            if hasattr(model, "vae") and hasattr(model.vae, "use_slicing"):
+                model.vae.use_slicing = od_config.vae_use_slicing
+            if hasattr(model, "vae") and hasattr(model.vae, "use_tiling"):
+                model.vae.use_tiling = od_config.vae_use_tiling
+
+            _apply_sequence_parallel_if_enabled(model, od_config)
 
         return model
     else:
         raise ValueError(f"Model class {od_config.model_class_name} not found in diffusion model registry.")
 
 
-def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -> None:
-    """Apply sequence parallelism hooks if SP is enabled.
+def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -> int:
+    """Apply sequence parallelism hooks if SP is enabled (legacy OFF path).
 
-    This is the centralized location for enabling SP, similar to diffusers'
-    ModelMixin.enable_parallelism() method. It applies _sp_plan hooks to
-    transformer models that define them.
+    Phase 1c §5.4 R1(c): this is now a thin wrapper around the shared
+    :func:`_apply_sp_runtime` helper extracted to
+    ``vllm_omni.diffusion.hooks.sequence_parallel``. The wrapper preserves the
+    Phase-1b ``try/except Exception`` sink (N1 deferred — see
+    ``DESIGN_PHASE1C_INIT_DISPATCH.md`` §3.2 N8 / §4.5.4 row 6) so OFF and ON
+    paths share bit-identical warn-and-continue failure-mode semantics on SP
+    wiring failure. The helper itself never swallows; the failure-mode parity
+    is provided HERE (OFF path) and inside each SP module's ``apply()`` body
+    (ON path, §5.5 A4).
 
-    Note: Our "Sequence Parallelism" (SP) corresponds to "Context Parallelism" (CP) in diffusers.
-    We use _sp_plan instead of diffusers' _cp_plan.
+    Note: Our "Sequence Parallelism" (SP) corresponds to "Context Parallelism"
+    (CP) in diffusers. We use ``_sp_plan`` / ``_sp_descriptor`` instead of
+    diffusers' ``_cp_plan``.
 
     Args:
-        model: The pipeline model (e.g., ZImagePipeline).
+        model: The pipeline model (e.g., ``ZImagePipeline``).
         od_config: The OmniDiffusion configuration.
+
+    Returns:
+        Number of transformer modules SP hooks were applied to (0 on
+        warn-and-continue failure or when SP is inert).
     """
-
     try:
-        sp_size = od_config.parallel_config.sequence_parallel_size
-        if sp_size <= 1:
-            return
-
-        # Find transformer model(s) in the pipeline that have _sp_plan
-        # Include transformer_2 for two-stage models (e.g., Wan MoE)
-        transformer_attrs = ["transformer", "transformer_2", "dit", "unet"]
-        applied_count = 0
-
-        # Phase 1b single divergence point: the typed SPDescriptor path vs the
-        # legacy free-form `_sp_plan` path. Default (False) runs the exact legacy
-        # branch below, so output is byte-identical to the pre-1b behavior.
-        use_descriptor = getattr(od_config.parallel_config, "use_sp_descriptor", False)
-
-        for attr in transformer_attrs:
-            if not hasattr(model, attr):
-                # Some pipeline like LTX2TwoStagesPipeline have recursive
-                # modules that have the transformer
-                module = find_module_with_attr(model, attr)
-                if module is None:
-                    continue
-                model = module
-
-            transformer = getattr(model, attr)
-            if transformer is None:
-                continue
-
-            if use_descriptor:
-                # Typed-descriptor path: SPInternal (Mechanism B) or a model with
-                # no descriptor registers no hooks (applied=False); an
-                # SPDescriptor expands to the same plan the legacy path uses.
-                from vllm_omni.diffusion.hooks.sequence_parallel import (
-                    apply_sequence_parallel_from_descriptor,
-                )
-
-                sp_config = SequenceParallelConfig(
-                    ulysses_degree=od_config.parallel_config.ulysses_degree,
-                    ring_degree=od_config.parallel_config.ring_degree,
-                )
-                applied = apply_sequence_parallel_from_descriptor(transformer, sp_config)
-                if applied:
-                    mode = (
-                        "hybrid"
-                        if sp_config.ulysses_degree > 1 and sp_config.ring_degree > 1
-                        else ("ulysses" if sp_config.ulysses_degree > 1 else "ring")
-                    )
-                    logger.info(
-                        f"Applying sequence parallelism to {transformer.__class__.__name__} ({attr}) "
-                        f"via SPDescriptor (sp_size={sp_size}, mode={mode}, "
-                        f"ulysses={sp_config.ulysses_degree}, ring={sp_config.ring_degree})"
-                    )
-                    applied_count += 1
-                continue
-
-            # ---- legacy path (unchanged; byte-identical when flag is OFF) ----
-            plan = get_sp_plan_from_model(transformer)
-            if plan is None:
-                continue
-
-            # Create SP config
-            sp_config = SequenceParallelConfig(
-                ulysses_degree=od_config.parallel_config.ulysses_degree,
-                ring_degree=od_config.parallel_config.ring_degree,
-            )
-
-            # Apply hooks according to the plan
-            mode = (
-                "hybrid"
-                if sp_config.ulysses_degree > 1 and sp_config.ring_degree > 1
-                else ("ulysses" if sp_config.ulysses_degree > 1 else "ring")
-            )
-            logger.info(
-                f"Applying sequence parallelism to {transformer.__class__.__name__} ({attr}) "
-                f"(sp_size={sp_size}, mode={mode}, ulysses={sp_config.ulysses_degree}, ring={sp_config.ring_degree})"
-            )
-            apply_sequence_parallel(transformer, sp_config, plan)
-            applied_count += 1
-
-        # update forward context sp_plan_hooks_applied
-        ctx = get_forward_context()
-        ctx.sp_plan_hooks_applied = applied_count > 0
-        logger.debug(f"Setting sp_plan_hooks_applied={ctx.sp_plan_hooks_applied} in ``ForwardContext``!")
-
-        if applied_count == 0:
-            logger.warning(
-                f"Sequence parallelism is enabled (sp_size={sp_size}) but no hook-based SP plan/descriptor "
-                "was applied to any transformer. This is expected for manual-SP models that implement "
-                "sequence parallelism inside forward() (e.g. an SPInternal-marked model like BAGEL). "
-                "Otherwise, consider adding an _sp_plan / _sp_descriptor to your transformer model."
-            )
-
+        applied_count = _apply_sp_runtime(model, od_config.parallel_config)
     except Exception as e:
-        logger.warning(f"Failed to apply sequence parallelism: {e}. Continuing without SP hooks.")
+        logger.warning(
+            f"Failed to apply sequence parallelism: {e}. "
+            "Continuing without SP hooks."
+        )
+        applied_count = 0
+    return applied_count
 
 
 _DIFFUSION_POST_PROCESS_FUNCS = {
