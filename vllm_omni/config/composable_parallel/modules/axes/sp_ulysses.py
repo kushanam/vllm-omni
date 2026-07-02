@@ -19,6 +19,8 @@ identical ``try/except Exception: logger.warning(...)`` sink (N1 deferred —
 """
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from vllm.logger import init_logger
 
 from vllm_omni.config.composable_parallel.backends import (
@@ -32,6 +34,11 @@ from vllm_omni.config.composable_parallel.modules.base import (
     LoweringCtx,
     OmniExecutedStrategy,
 )
+from vllm_omni.config.composable_parallel.validation import _validate_sequence_parallel
+
+if TYPE_CHECKING:
+    from vllm_omni.config.composable_parallel.spec import StrategySpec
+    from vllm_omni.config.composable_parallel.validation import L1Owner
 
 logger = init_logger(__name__)
 
@@ -46,6 +53,12 @@ class UlyssesSequenceParallelStrategy(OmniExecutedStrategy):
 
     def __init__(self, degree: int):
         self._degree = int(degree)
+
+    @classmethod
+    def validate(cls, spec: "StrategySpec", owner: "L1Owner") -> None:
+        # Shared verbatim body with sp_ring (the old central ``_validate_sp``),
+        # keyed off ``spec.mesh_axis.kind`` so the ``{kind}`` message stays exact.
+        _validate_sequence_parallel(spec, owner)
 
     def plan(self, ctx: LoweringCtx) -> AxisPlan:
         engine_kwargs = {"ulysses_degree": self._degree} if self._degree > 1 else {}

@@ -16,6 +16,8 @@ the ownership view differs — ``engine_kwargs`` is identical in both cases — 
 """
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from vllm_omni.config.composable_parallel.backends import (
     VLLM_BACKEND,
     axis_execution_owner,
@@ -25,6 +27,12 @@ from vllm_omni.config.composable_parallel.modules.base import (
     DelegatedStrategy,
     LoweringCtx,
 )
+from vllm_omni.config.composable_parallel.routing import Broadcast
+from vllm_omni.config.composable_parallel.validation import _fail
+
+if TYPE_CHECKING:
+    from vllm_omni.config.composable_parallel.spec import StrategySpec
+    from vllm_omni.config.composable_parallel.validation import L1Owner
 
 
 class TensorParallelStrategy(DelegatedStrategy):
@@ -32,6 +40,13 @@ class TensorParallelStrategy(DelegatedStrategy):
 
     def __init__(self, degree: int):
         self._degree = int(degree)
+
+    @classmethod
+    def validate(cls, spec: "StrategySpec", owner: "L1Owner") -> None:
+        if not isinstance(spec.routing, Broadcast):
+            _fail(f"tp axis {spec.name!r} expects Broadcast routing, got {type(spec.routing).__name__}")
+        if owner != "engine":
+            _fail(f"tp axis {spec.name!r} is realized intra-engine; l1_owner must be 'engine', got {owner!r}")
 
     def plan(self, ctx: LoweringCtx) -> AxisPlan:
         # Owner comes from the backend's execution-owner table (vocabulary #2),

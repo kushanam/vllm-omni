@@ -20,6 +20,8 @@ EP validate step in Phase 2. This module only makes the ownership view faithful.
 """
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from vllm_omni.config.composable_parallel.backends import (
     VLLM_BACKEND,
     axis_execution_owner,
@@ -29,6 +31,12 @@ from vllm_omni.config.composable_parallel.modules.base import (
     DelegatedStrategy,
     LoweringCtx,
 )
+from vllm_omni.config.composable_parallel.routing import Broadcast
+from vllm_omni.config.composable_parallel.validation import _fail
+
+if TYPE_CHECKING:
+    from vllm_omni.config.composable_parallel.spec import StrategySpec
+    from vllm_omni.config.composable_parallel.validation import L1Owner
 
 
 class ExpertParallelStrategy(DelegatedStrategy):
@@ -36,6 +44,18 @@ class ExpertParallelStrategy(DelegatedStrategy):
 
     def __init__(self, degree: int):
         self._degree = int(degree)
+
+    @classmethod
+    def validate(cls, spec: "StrategySpec", owner: "L1Owner") -> None:
+        # Dense EP: every rank still sees the whole batch, experts are sharded
+        # across ranks inside the engine (sparse MoE all-to-all is a later stage).
+        if not isinstance(spec.routing, Broadcast):
+            _fail(
+                f"ep axis {spec.name!r} expects Broadcast routing (dense expert parallel), "
+                f"got {type(spec.routing).__name__}"
+            )
+        if owner != "engine":
+            _fail(f"ep axis {spec.name!r} is realized intra-engine; l1_owner must be 'engine', got {owner!r}")
 
     def plan(self, ctx: LoweringCtx) -> AxisPlan:
         # Owner from the backend execution-owner table (vocabulary #2), not an

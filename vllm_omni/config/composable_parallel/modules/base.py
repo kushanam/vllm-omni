@@ -22,6 +22,12 @@ if TYPE_CHECKING:
     # so base.py stays runtime-independent of backends.py (which imports base.py),
     # keeping the module import graph cycle-free.
     from vllm_omni.config.composable_parallel.backends import BackendAxisOwnership
+    # Spec + l1_owner types for the ``validate`` contract (annotation only).
+    # Imported under TYPE_CHECKING so base.py stays a leaf w.r.t. spec.py /
+    # validation.py at runtime (validation.py does NOT import base.py, so this is
+    # cycle-free even for the type checker).
+    from vllm_omni.config.composable_parallel.spec import StrategySpec
+    from vllm_omni.config.composable_parallel.validation import L1Owner
 
 # ---------------------------------------------------------------------------
 # Axis identity
@@ -188,6 +194,16 @@ class StrategyModule(Protocol):
     # meaningful when ``supports_init_dispatch`` is True. Replaces the old
     # global ``APPLY_ORDER`` tuple.
     init_dispatch_order: int
+    # Per-axis translator validation (findings #6/#7). A classmethod so the
+    # translator can dispatch on the module *class* without constructing an
+    # instance (construction needs the degree, and ``stage_replica`` needs the
+    # omni LB policy — neither is needed to validate). ``owner`` is the
+    # translator's resolved ``l1_owner`` (vocabulary #1), NOT ``AxisPlan.owned_by``.
+    # Most axes return ``None``; ``stage_replica`` additionally RETURNS its
+    # resolved omni LB policy string (the translator loop consumes the return
+    # value), hence the ``str | None`` return.
+    @classmethod
+    def validate(cls, spec: "StrategySpec", owner: "L1Owner") -> str | None: ...
     def plan(self, ctx: LoweringCtx) -> AxisPlan: ...
     def build_groups(self, ctx: GroupBuildCtx) -> AxisResult: ...
     def apply(self, ctx: ApplyCtx) -> AxisResult: ...
@@ -204,6 +220,11 @@ class OmniExecutedStrategy:
     # Ascending init-dispatch order key (§2.3); unused while
     # ``supports_init_dispatch`` is False.
     init_dispatch_order: int = 0
+    # Default: no translator validation. Translatable axes override this with the
+    # verbatim per-axis check (findings #6/#7); a module that is dispatched by the
+    # translator without overriding it fails loudly rather than silently passing.
+    @classmethod
+    def validate(cls, spec: "StrategySpec", owner: "L1Owner") -> str | None: raise NotImplementedError
     def plan(self, ctx: LoweringCtx) -> AxisPlan: raise NotImplementedError
     def build_groups(self, ctx: GroupBuildCtx) -> AxisResult: raise NotImplementedError
     def apply(self, ctx: ApplyCtx) -> AxisResult: raise NotImplementedError
@@ -217,6 +238,9 @@ class DelegatedStrategy:
     # composable layer never applies them at init, so this is always False.
     supports_init_dispatch: bool = False
     init_dispatch_order: int = 0
+    # Default: no translator validation (see OmniExecutedStrategy.validate).
+    @classmethod
+    def validate(cls, spec: "StrategySpec", owner: "L1Owner") -> str | None: raise NotImplementedError
     def plan(self, ctx: LoweringCtx) -> AxisPlan: raise NotImplementedError
     def build_groups(self, ctx: GroupBuildCtx) -> AxisResult:
         return AxisResult.delegated(self.axis)
