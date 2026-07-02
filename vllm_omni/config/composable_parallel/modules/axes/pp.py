@@ -5,9 +5,16 @@
 ``plan()`` emits the same engine kwarg the translator emits for a ``pp`` axis
 (``pipeline_parallel_size``). ``build_groups()`` / ``apply()`` are the typed
 no-ops inherited from :class:`DelegatedStrategy` (vLLM owns this axis).
+``owned_by`` is execution-type-invariant (``vllm``) but is resolved from the
+backend's execution-owner table via :func:`axis_execution_owner` so
+``AxisPlan.owned_by`` has a single source of truth for all axes.
 """
 from __future__ import annotations
 
+from vllm_omni.config.composable_parallel.backends import (
+    VLLM_BACKEND,
+    axis_execution_owner,
+)
 from vllm_omni.config.composable_parallel.modules.base import (
     AxisPlan,
     DelegatedStrategy,
@@ -25,6 +32,6 @@ class PipelineParallelStrategy(DelegatedStrategy):
         return AxisPlan(
             axis="pp",
             degree=self._degree,
-            owned_by="vllm",
+            owned_by=axis_execution_owner(ctx.backend or VLLM_BACKEND, self.axis, ctx.execution_type),
             engine_kwargs={"pipeline_parallel_size": self._degree},
         )

@@ -30,6 +30,10 @@ from __future__ import annotations
 
 from vllm.logger import init_logger
 
+from vllm_omni.config.composable_parallel.backends import (
+    VLLM_BACKEND,
+    axis_execution_owner,
+)
 from vllm_omni.config.composable_parallel.modules.base import (
     ApplyCtx,
     AxisPlan,
@@ -59,7 +63,7 @@ class RingSequenceParallelStrategy(OmniExecutedStrategy):
         return AxisPlan(
             axis="sp_ring",
             degree=self._degree,
-            owned_by="omni",
+            owned_by=axis_execution_owner(ctx.backend or VLLM_BACKEND, self.axis, ctx.execution_type),
             engine_kwargs=engine_kwargs,
         )
 

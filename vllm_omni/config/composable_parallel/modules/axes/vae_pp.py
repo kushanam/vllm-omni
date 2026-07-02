@@ -18,6 +18,10 @@ from __future__ import annotations
 
 from vllm.logger import init_logger
 
+from vllm_omni.config.composable_parallel.backends import (
+    VLLM_BACKEND,
+    axis_execution_owner,
+)
 from vllm_omni.config.composable_parallel.modules.base import (
     ApplyCtx,
     AxisPlan,
@@ -48,7 +52,7 @@ class VaePatchParallelStrategy(OmniExecutedStrategy):
         return AxisPlan(
             axis="vae_pp",
             degree=self._degree,
-            owned_by="omni",
+            owned_by=axis_execution_owner(ctx.backend or VLLM_BACKEND, self.axis, ctx.execution_type),
             engine_kwargs={"vae_patch_parallel_size": self._degree},
             rank_token=None,            # reuses the DiT group
             consumes_world_dim=False,   # capped at DiT world size; adds no ranks

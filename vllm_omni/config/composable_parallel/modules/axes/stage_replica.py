@@ -12,6 +12,10 @@ authoritative writer remains ``apply_strategy_specs`` in Phase 1.
 """
 from __future__ import annotations
 
+from vllm_omni.config.composable_parallel.backends import (
+    VLLM_BACKEND,
+    axis_execution_owner,
+)
 from vllm_omni.config.composable_parallel.modules.base import (
     AxisPlan,
     LoweringCtx,
@@ -33,7 +37,7 @@ class StageReplicaStrategy(OmniExecutedStrategy):
         return AxisPlan(
             axis="stage_replica",
             degree=self._degree,
-            owned_by="omni",
+            owned_by=axis_execution_owner(ctx.backend or VLLM_BACKEND, self.axis, ctx.execution_type),
             engine_kwargs=engine_kwargs,
             rank_token=None,
             consumes_world_dim=False,

@@ -235,7 +235,21 @@ class Orchestrator:
                     )
                 module = _build_module(spec)
                 modules.append(module)
-                plans.append(module.plan(LoweringCtx(spec=spec, execution_type=execution_type)))
+                # Thread the active backend so execution-type-sensitive modules
+                # (tp/ep) — and every module, for single-source-of-truth — resolve
+                # ``owned_by`` from ``self.backend.executes`` via
+                # ``axis_execution_owner`` (design §3.3). Default None would resolve
+                # to VLLM_BACKEND anyway; passing it explicitly keeps a non-vLLM
+                # backend's ownership faithful with no other change.
+                plans.append(
+                    module.plan(
+                        LoweringCtx(
+                            spec=spec,
+                            execution_type=execution_type,
+                            backend=self.backend,
+                        )
+                    )
+                )
             modules_by_role[role] = modules
             plans_by_role[role] = plans
         return modules_by_role, plans_by_role

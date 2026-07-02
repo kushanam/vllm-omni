@@ -18,6 +18,10 @@ if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
     # omni GroupCoordinator (diffusion side). Imported lazily to keep plan() torch-free.
     from vllm_omni.diffusion.distributed.parallel_state import GroupCoordinator
+    # Backend axis-ownership table (annotation only). Imported under TYPE_CHECKING
+    # so base.py stays runtime-independent of backends.py (which imports base.py),
+    # keeping the module import graph cycle-free.
+    from vllm_omni.config.composable_parallel.backends import BackendAxisOwnership
 
 # ---------------------------------------------------------------------------
 # Axis identity
@@ -121,6 +125,13 @@ class LoweringCtx:
     raw_degree: int | None = None        # degree from raw deploy/engine args (no-yaml front-end)
     execution_type: object | None = None # StageExecutionType (disambiguates tp owner; §8 N1)
     shard_extension: Mapping[str, object] = field(default_factory=dict)
+    # The active backend's axis-ownership table, consulted by execution-type-
+    # sensitive modules (tp/ep) — and, for single-source-of-truth, every axis
+    # module — to resolve ``AxisPlan.owned_by`` via ``axis_execution_owner``.
+    # ``None`` means "the default vLLM backend" (resolved lazily by the module,
+    # avoiding an import-time dependency on backends.py), so bare
+    # ``plan(LoweringCtx())`` introspection calls stay behavior-identical.
+    backend: "BackendAxisOwnership | None" = None
 
 
 @dataclass
